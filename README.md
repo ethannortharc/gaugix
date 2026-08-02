@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="frontend/public/favicon.svg" width="72" height="72" alt="Gaugix logo">
+  <img src="docs/images/gaugix-mark.svg" width="72" height="72" alt="Gaugix logo">
 </p>
 
 <h1 align="center">Gaugix</h1>
