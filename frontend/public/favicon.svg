@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <rect width="32" height="32" rx="7" fill="#0f1a20"/>
+  <!-- gauge arc -->
+  <path d="M7 22a10 10 0 0 1 18 0" fill="none" stroke="#2c3f49" stroke-width="3" stroke-linecap="round"/>
+  <path d="M7 22a10 10 0 0 1 6.2-9.25" fill="none" stroke="#4fd0d8" stroke-width="3" stroke-linecap="round"/>
+  <!-- needle -->
+  <path d="M16 22 L21.5 14.5" stroke="#4fd0d8" stroke-width="2.2" stroke-linecap="round"/>
+  <circle cx="16" cy="22" r="2.2" fill="#4fd0d8"/>
+</svg>

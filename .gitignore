@@ -1,0 +1,58 @@
+# --- secrets ---------------------------------------------------------------
+.env
+.env.local
+*.pem
+
+# --- app data (SQLite DB, artifacts, logs, exports) ------------------------
+data/
+
+# --- python ----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+
+# --- node ------------------------------------------------------------------
+node_modules/
+frontend/dist/
+.vite/
+*.tsbuildinfo
+npm-debug.log*
+
+# --- playwright ------------------------------------------------------------
+test-results/
+playwright-report/
+
+# --- local demo production -------------------------------------------------
+.demo-studio/
+
+blob-report/
+
+# --- os / editors ----------------------------------------------------------
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+
+# playwright-mcp scratch output. The snapshot/screenshot tools also drop files
+# in the repo root when given a bare filename, so those shapes are named too —
+# an item59.yml and a sets.png were committed that way.
+.playwright-mcp/
+/*.png
+/*.jpeg
+/page-*.yml
+/item*.yml
+# Cumulative real-API smoke-call counter (lives outside data/ so a reseed cannot reset it)
+.gaugix-smoke-calls
+.e2e-data/
+test-results/
+playwright-report/

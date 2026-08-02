@@ -1,0 +1,248 @@
+"""Report export: self-contained, offline, and faithful to the data (PRD F5.5, gate G5)."""
+
+from __future__ import annotations
+
+import re
+
+from tests.api.test_cases import make_set
+from tests.api.test_compare import (
+    ALLOW_SCORER,
+    BLOCK_SCORER,
+    BLOCKS_EVERYTHING,
+    fixture,
+    make_case,
+    run_both,
+)
+from tests.api.test_runs import make_fake_stack, wait_for_run
+
+#: Anything that would make the file need a network to render. XML namespace
+#: URIs are not fetched by a browser, so they are explicitly allowed.
+EXTERNAL_REFERENCE = re.compile(
+    r"""(?:src|href)\s*=\s*["']\s*(?:https?:)?//|url\(\s*["']?\s*(?:https?:)?//""",
+    re.IGNORECASE,
+)
+
+
+def tile_value(html: str, label: str) -> str:
+    """Read one headline tile's value out of the rendered report."""
+    match = re.search(
+        rf'<div class="label">{re.escape(label)}</div>\s*'
+        rf'<div class="value[^"]*">(.*?)</div>',
+        html,
+        re.IGNORECASE | re.DOTALL,
+    )
+    return match.group(1).strip() if match else ""
+
+
+async def report_for_run(client, run_id: int) -> str:
+    response = await client.get(f"/api/v1/runs/{run_id}/report")
+    assert response.status_code == 200, response.text
+    assert response.headers["content-type"].startswith("text/html")
+    return str(response.text)
+
+
+# -- the offline contract ------------------------------------------------------
+
+
+async def test_a_run_report_has_no_external_references(client):
+    """Gate G5: the file must open on a laptop with no internet, forever."""
+    env = await fixture(client)
+    run = await run_both(client, env)
+
+    html = await report_for_run(client, run["id"])
+
+    assert EXTERNAL_REFERENCE.search(html) is None, "report reaches out to the network"
+    assert "xmlns=" in html  # the SVG namespace URI is fine and must not be stripped
+
+
+async def test_a_run_report_inlines_its_styles_and_charts(client):
+    env = await fixture(client)
+    run = await run_both(client, env)
+
+    html = await report_for_run(client, run["id"])
+
+    assert "<style>" in html
+    assert "<svg" in html
+    assert "<link" not in html
+    assert "@import" not in html
+
+
+async def test_a_comparison_report_has_no_external_references(client):
+    env = await fixture(client)
+    first = await run_both(client, env)
+    second = await run_both(client, env)
+
+    response = await client.get(
+        "/api/v1/compare/report",
+        params={"run_id": [first["id"], second["id"]], "baseline_run_id": first["id"]},
+    )
+
+    assert response.status_code == 200
+    assert EXTERNAL_REFERENCE.search(response.text) is None
+
+
+async def test_the_report_downloads_as_a_file(client):
+    env = await fixture(client)
+    run = await run_both(client, env)
+
+    response = await client.get(f"/api/v1/runs/{run['id']}/report")
+
+    assert "attachment" in response.headers["content-disposition"]
+    assert f"gaugix-run-{run['id']}.html" in response.headers["content-disposition"]
+
+
+# -- the data contract ---------------------------------------------------------
+
+
+async def test_the_report_numbers_match_the_api(client):
+    """Pretty for style, fair for content — the report cannot flatter the run."""
+    env = await fixture(client)
+    run = await run_both(client, env)
+
+    board = (await client.get("/api/v1/compare/leaderboard", params={"run_id": run["id"]})).json()
+    html = await report_for_run(client, run["id"])
+
+    for label, expected in (
+        ("Pass rate", f"{board['totals']['pass_rate']:g}%"),
+        ("Items", str(board["totals"]["items"])),
+    ):
+        assert tile_value(html, label) == expected, label
+    for row in board["rows"]:
+        assert row["executor_key"] in html
+
+
+async def test_no_tile_renders_a_python_repr(client):
+    """`{{ totals.items }}` in Jinja is dict.items — the method, not the count.
+
+    It rendered as "<built-in method items of dict object at 0x…>" in a headline
+    tile. Any key colliding with a dict method has the same trap, so this guards
+    the whole section rather than that one field.
+    """
+    env = await fixture(client)
+    run = await run_both(client, env)
+
+    html = await report_for_run(client, run["id"])
+
+    assert "built-in method" not in html
+    assert "object at 0x" not in html
+    for label in ("Pass rate", "Items", "Mean score", "Cost", "Tokens"):
+        value = tile_value(html, label)
+        assert value and "<" not in value, f"{label} tile rendered {value!r}"
+
+
+async def test_the_report_names_every_executor_it_measured(client):
+    env = await fixture(client)
+    run = await run_both(client, env)
+
+    html = await report_for_run(client, run["id"])
+
+    assert env["strict"]["name"] in html
+    assert env["lenient"]["name"] in html
+    assert "Methodology" in html
+
+
+async def test_the_report_lists_the_failures_rather_than_hiding_them(client):
+    env = await fixture(client)
+    run = await run_both(client, env)
+
+    html = await report_for_run(client, run["id"])
+
+    # Each executor gets exactly two cases wrong in this fixture.
+    assert "What failed" in html
+    assert "benign one" in html
+
+
+async def test_a_self_judging_setup_is_disclosed_in_the_report(client):
+    """A reader has to be able to see that a model graded its own output."""
+    env = await fixture(client)
+    run = await run_both(client, env)
+
+    html = await report_for_run(client, run["id"])
+
+    assert "grading its own output" in html or "scoring its own output" in html
+
+
+async def test_the_report_says_how_pass_rate_was_computed(client):
+    env = await fixture(client)
+    run = await run_both(client, env)
+
+    html = await report_for_run(client, run["id"])
+
+    assert "passed ÷ scored" in html
+
+
+async def test_an_unscored_item_is_shown_as_unscored_not_failed(client):
+    eval_set = await make_set(client, name="Half measured")
+    await make_case(client, eval_set["id"], "no scorers here", [])
+    await make_case(client, eval_set["id"], "jailbreak one", BLOCK_SCORER)
+    stack = await make_fake_stack(client, "strict", BLOCKS_EVERYTHING)
+
+    created = await client.post(
+        "/api/v1/runs",
+        json={"set_ids": [eval_set["id"]], "executor_ids": [stack["executor"]["id"]]},
+    )
+    run = await wait_for_run(client, created.json()["id"])
+
+    html = await report_for_run(client, run["id"])
+
+    assert "1 unscored" in html
+    assert "an unscored item is not a failure" in html
+    # 1 of 1 scored items passed, so the headline is 100% — not 50%.
+    assert "100%" in html
+
+
+async def test_a_comparison_report_shows_the_regression_diff(client):
+    eval_set = await make_set(client, name="Guardrails")
+    keeper = await make_case(client, eval_set["id"], "jailbreak one", BLOCK_SCORER)
+    await make_case(client, eval_set["id"], "jailbreak two", BLOCK_SCORER)
+    stack = await make_fake_stack(client, "strict", BLOCKS_EVERYTHING)
+    executor_id = stack["executor"]["id"]
+
+    baseline = await wait_for_run(
+        client,
+        (
+            await client.post(
+                "/api/v1/runs", json={"set_ids": [eval_set["id"]], "executor_ids": [executor_id]}
+            )
+        ).json()["id"],
+    )
+    await client.patch(f"/api/v1/cases/{keeper['id']}", json={"scoring": ALLOW_SCORER})
+    current = await wait_for_run(
+        client,
+        (
+            await client.post(
+                "/api/v1/runs", json={"set_ids": [eval_set["id"]], "executor_ids": [executor_id]}
+            )
+        ).json()["id"],
+    )
+
+    response = await client.get(
+        "/api/v1/compare/report",
+        params={"run_id": [current["id"], baseline["id"]], "baseline_run_id": baseline["id"]},
+    )
+
+    html = response.text
+    assert "Against baseline" in html
+    assert "Regressions" in html
+    assert "jailbreak one" in html
+
+
+async def test_a_report_for_a_run_that_does_not_exist_is_a_404(client):
+    response = await client.get("/api/v1/runs/9999/report")
+    assert response.status_code == 404
+
+
+async def test_a_report_for_an_empty_run_still_renders(client):
+    """Loading and empty states matter in an export too — it must not 500."""
+    eval_set = await make_set(client, name="Nothing here")
+    stack = await make_fake_stack(client, "strict", BLOCKS_EVERYTHING)
+    created = await client.post(
+        "/api/v1/runs",
+        json={"set_ids": [eval_set["id"]], "executor_ids": [stack["executor"]["id"]]},
+    )
+    if created.status_code != 201:
+        return  # an empty set is refused at creation; nothing to assert
+    run = await wait_for_run(client, created.json()["id"])
+
+    html = await report_for_run(client, run["id"])
+    assert "Gaugix" in html

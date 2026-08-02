@@ -1,0 +1,127 @@
+[project]
+name = "gaugix"
+version = "0.1.0"
+description = "Gaugix — a local-first LLM evaluation workbench"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "Ethan H.B. Zhou" }]
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "sqlmodel>=0.0.22",
+    "alembic>=1.14.0",
+    "litellm>=1.55.0",
+    "sse-starlette>=2.1.3",
+    "pydantic-settings>=2.6.0",
+    "python-dotenv>=1.0.1",
+    "structlog>=24.4.0",
+    "jinja2>=3.1.4",
+    "pyyaml>=6.0.2",
+    "jsonschema>=4.23.0",
+    "python-multipart>=0.0.20",
+    "httpx>=0.27.2",
+]
+
+[project.scripts]
+gaugix = "gaugix.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.3",
+    "pytest-asyncio>=0.24.0",
+    "mypy>=1.13.0",
+    "ruff>=0.8.0",
+    "types-pyyaml>=6.0.12",
+    "types-jsonschema>=4.23.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gaugix"]
+
+# ---------------------------------------------------------------------------
+# ruff — lint + format
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+extend-exclude = ["migrations/versions"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "B",    # flake8-bugbear
+    "C4",   # comprehensions
+    "UP",   # pyupgrade
+    "SIM",  # simplify
+    "RUF",  # ruff-specific
+    "ASYNC",
+]
+ignore = [
+    "B008",   # FastAPI Depends() in defaults is idiomatic
+    "RUF012", # mutable class attrs need ClassVar — noisy with SQLModel
+    # The spec docs use ×, —, § deliberately; prose mirrors them.
+    "RUF001",
+    "RUF002",
+    "RUF003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101"]
+# Verbatim prompt text — reflowing it would change what the model is asked.
+"src/gaugix/api/gen.py" = ["E501"]
+"src/gaugix/scoring/judge.py" = ["E501"]
+
+# ---------------------------------------------------------------------------
+# mypy — strict on the correctness-critical packages, normal elsewhere
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.12"
+files = ["src", "tests"]
+plugins = []
+ignore_missing_imports = true
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = false
+no_implicit_optional = true
+check_untyped_defs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+
+[[tool.mypy.overrides]]
+module = ["gaugix.engine.*", "gaugix.scoring.*", "gaugix.harness.*"]
+strict = true
+
+[[tool.mypy.overrides]]
+module = ["tests.*"]
+# Test helpers stay untyped on purpose — annotating every fixture-consuming
+# function adds noise without catching anything the assertions do not.
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+disallow_untyped_calls = false
+disable_error_code = ["type-arg"]
+
+[[tool.mypy.overrides]]
+module = ["gaugix.models.*", "gaugix.migrations.*"]
+# SQLModel's declarative magic confuses strict attribute typing.
+disallow_untyped_defs = true
+
+# ---------------------------------------------------------------------------
+# pytest
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+addopts = "-q --strict-markers"
+filterwarnings = [
+    "ignore::DeprecationWarning:litellm.*",
+    "ignore::DeprecationWarning:pydantic.*",
+]

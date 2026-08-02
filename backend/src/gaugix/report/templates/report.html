@@ -1,0 +1,362 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>{{ title }} — Gaugix report</title>
+<style>
+/*
+ * Everything is inline on purpose: this file has to open offline, forever.
+ * No CDN, no web font, no remote image. See report/build.py.
+ */
+:root {
+  --ink: #22262c;
+  --muted: #6b7280;
+  --line: #e3e6ea;
+  --paper: #ffffff;
+  --wash: #f7f8fa;
+  --pass: #3f9f6f;
+  --fail: #d4564a;
+  --error: #c98a2e;
+  --accent: #2f8f9d;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  padding: 40px 24px 72px;
+  background: var(--wash);
+  color: var(--ink);
+  font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+.sheet { max-width: 900px; margin: 0 auto; }
+header.masthead { border-bottom: 2px solid var(--ink); padding-bottom: 16px; margin-bottom: 28px; }
+.eyebrow {
+  font-size: 11px; letter-spacing: .14em; text-transform: uppercase;
+  color: var(--accent); font-weight: 600; margin: 0 0 6px;
+}
+h1 { font-size: 27px; line-height: 1.2; margin: 0 0 8px; letter-spacing: -.01em; }
+.partial-tag {
+  font-size: 12px; letter-spacing: .06em; text-transform: uppercase;
+  vertical-align: middle; border: 1px solid #b45309; color: #b45309;
+  border-radius: 4px; padding: 2px 6px; font-weight: 600;
+}
+.partial-banner {
+  border: 1px solid #b45309; background: #fef3c7; color: #713f12;
+  border-radius: 6px; padding: 12px 14px; margin: 0 0 24px; font-size: 13px;
+}
+.partial-banner ul { margin: 8px 0 0; padding-left: 20px; }
+h2 { font-size: 17px; margin: 34px 0 12px; letter-spacing: -.005em; }
+h3 { font-size: 13px; margin: 20px 0 8px; color: var(--muted); font-weight: 600;
+     text-transform: uppercase; letter-spacing: .07em; }
+p { margin: 0 0 12px; }
+.sub { color: var(--muted); font-size: 13px; margin: 0; }
+.card {
+  background: var(--paper); border: 1px solid var(--line); border-radius: 10px;
+  padding: 18px 20px; margin-bottom: 16px;
+}
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; }
+.tile { background: var(--paper); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+.tile .label { font-size: 11px; text-transform: uppercase; letter-spacing: .07em; color: var(--muted); }
+.tile .value { font-size: 24px; font-weight: 600; font-variant-numeric: tabular-nums; margin-top: 2px; }
+.tile .value.small { font-size: 18px; }
+table { width: 100%; border-collapse: collapse; font-size: 13.5px; font-variant-numeric: tabular-nums; }
+th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); font-weight: 600; }
+tbody tr:last-child td { border-bottom: none; }
+td.n, th.n { text-align: right; }
+.pill {
+  display: inline-block; padding: 1px 8px; border-radius: 999px;
+  font-size: 11px; font-weight: 600; border: 1px solid;
+}
+.pill.pass { color: var(--pass); border-color: var(--pass); background: rgba(63,159,111,.08); }
+.pill.fail { color: var(--fail); border-color: var(--fail); background: rgba(212,86,74,.08); }
+.pill.error { color: var(--error); border-color: var(--error); background: rgba(201,138,46,.08); }
+.pill.muted { color: var(--muted); border-color: var(--line); background: var(--wash); }
+.chart { margin: 8px 0 4px; }
+code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
+details { border-top: 1px solid var(--line); padding: 8px 0; }
+details:first-of-type { border-top: none; }
+summary { cursor: pointer; font-size: 13.5px; }
+summary::marker { color: var(--muted); }
+pre {
+  background: var(--wash); border: 1px solid var(--line); border-radius: 6px;
+  padding: 10px 12px; overflow-x: auto; font-size: 12px; margin: 8px 0 0;
+  white-space: pre-wrap; word-break: break-word;
+}
+footer { margin-top: 40px; padding-top: 18px; border-top: 1px solid var(--line);
+         font-size: 12.5px; color: var(--muted); }
+footer dt { font-weight: 600; color: var(--ink); margin-top: 10px; font-size: 12px; }
+footer dd { margin: 2px 0 0; }
+.rule-note { font-size: 12.5px; color: var(--muted); margin-top: 6px; }
+@media print {
+  body { background: var(--paper); padding: 0; }
+  .card, .tile { break-inside: avoid; }
+  details { break-inside: avoid; }
+  details > summary { list-style: none; }
+  details[open] { page-break-inside: auto; }
+}
+</style>
+</head>
+<body>
+<div class="sheet">
+
+<header class="masthead">
+  <p class="eyebrow">Gaugix {{ kind }} report</p>
+  <h1>{{ title }}{% if partial_coverage %} <span class="partial-tag">partial run</span>{% endif %}</h1>
+  <p class="sub">Generated {{ generated_at }} · Gaugix {{ version }}</p>
+</header>
+
+{#
+  A report leaves the building. Every other surface can rely on the reader
+  having context; this one cannot, so a run that covered part of its sets says
+  so above the numbers rather than anywhere below them.
+#}
+{% if partial_coverage %}
+<section class="partial-banner">
+  <strong>This run covered part of its sets.</strong>
+  The figures below describe the cases listed here, not the whole set — they
+  are not comparable with a full-set run.
+  <ul>
+    {% for line in partial_coverage %}<li>{{ line }}</li>{% endfor %}
+  </ul>
+</section>
+{% endif %}
+
+{% set t = totals %}
+{# `t` is a dict, so `t.items` would resolve to dict.items — the *method*.
+   Any key that shares a name with a dict method needs bracket access. #}
+<section class="tiles">
+  <div class="tile">
+    <div class="label">Pass rate</div>
+    <div class="value">{{ t.pass_rate | pct }}</div>
+  </div>
+  <div class="tile">
+    <div class="label">Items</div>
+    <div class="value">{{ t['items'] }}</div>
+  </div>
+  <div class="tile">
+    <div class="label">Mean score</div>
+    <div class="value">{{ t.mean_score | pct if t.mean_score is not none else '—' }}</div>
+  </div>
+  <div class="tile">
+    <div class="label">Cost</div>
+    <div class="value small">{{ t.cost_usd | money }}{% if t.cost_unknown %} +{% endif %}</div>
+  </div>
+  <div class="tile">
+    <div class="label">Tokens</div>
+    <div class="value small">{{ (t.prompt_tokens + t.completion_tokens) | num }}</div>
+  </div>
+</section>
+{% if t.cost_unknown %}
+<p class="rule-note">
+  “+” means at least one call could not be priced, so the cost shown is a floor, not a total.
+</p>
+{% endif %}
+
+<h2>Verdicts</h2>
+<div class="card">
+  <div class="chart">{{ charts.split | safe }}</div>
+  <p class="rule-note">
+    {{ t.passed }} passed, {{ t.failed }} failed, {{ t.unscored }} unscored
+    {%- if t.errors %}, {{ t.errors }} errored{% endif %}
+    {%- if t.needs_human %}, {{ t.needs_human }} waiting on review{% endif %}.
+    Pass rate counts scored items only — an unscored item is not a failure.
+  </p>
+</div>
+
+<h2>By executor</h2>
+<div class="card">
+  <div class="chart">{{ charts.pass_rate | safe }}</div>
+  <table>
+    <thead>
+      <tr>
+        <th>Executor</th>
+        <th class="n">Pass rate</th>
+        <th class="n">Passed</th>
+        <th class="n">Failed</th>
+        <th class="n">Unscored</th>
+        <th class="n">Mean score</th>
+        <th class="n">Cost</th>
+        <th class="n">Mean latency</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in leaderboard.rows %}
+      <tr>
+        <td>{{ row.executor_key }}</td>
+        <td class="n">{{ row.pass_rate | pct }}</td>
+        <td class="n">{{ row.passed }}</td>
+        <td class="n">{{ row.failed }}</td>
+        <td class="n">{{ row.unscored }}</td>
+        <td class="n">{{ row.mean_score | pct if row.mean_score is not none else '—' }}</td>
+        <td class="n">{{ row.cost_usd | money }}{% if row.cost_unknown %}+{% endif %}</td>
+        <td class="n">{{ row.mean_latency_ms | num }} ms</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+{% if aggregate and aggregate.rows | length > 1 %}
+<h2>By set</h2>
+<div class="card">
+  <table>
+    <thead>
+      <tr>
+        <th>Set</th>
+        {% for executor in aggregate.executors %}<th class="n">{{ executor }}</th>{% endfor %}
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in aggregate.rows %}
+      <tr>
+        <td>{{ row.set_name }}</td>
+        {% for executor in aggregate.executors %}
+        <td class="n">
+          {% if executor in row.cells %}{{ row.cells[executor].pass_rate | pct }}{% else %}—{% endif %}
+        </td>
+        {% endfor %}
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+
+{% if diff %}
+<h2>Against baseline</h2>
+<div class="card">
+  <p class="sub">
+    Run {{ diff.current_run_id }} compared with baseline run {{ diff.baseline_run_id }}.
+  </p>
+  <section class="tiles" style="margin-top:12px">
+    <div class="tile"><div class="label">Regressions</div>
+      <div class="value">{{ diff.counts.regressed }}</div></div>
+    <div class="tile"><div class="label">Improvements</div>
+      <div class="value">{{ diff.counts.improved }}</div></div>
+    <div class="tile"><div class="label">Unchanged</div>
+      <div class="value">{{ diff.counts.unchanged }}</div></div>
+    <div class="tile"><div class="label">New</div>
+      <div class="value">{{ diff.counts.new }}</div></div>
+    <div class="tile"><div class="label">Removed</div>
+      <div class="value">{{ diff.counts.removed }}</div></div>
+  </section>
+  {% if diff.executors.only_current or diff.executors.only_baseline %}
+  <p class="rule-note">
+    The two runs did not use the same executors
+    {%- if diff.executors.only_current %} (only in this run:
+      {{ diff.executors.only_current | join(', ') }}){% endif %}
+    {%- if diff.executors.only_baseline %} (only in the baseline:
+      {{ diff.executors.only_baseline | join(', ') }}){% endif %},
+    so those cases are counted as new or removed rather than as changes.
+  </p>
+  {% endif %}
+  {% if charts.deltas %}<div class="chart">{{ charts.deltas | safe }}</div>{% endif %}
+
+  {% set regressions = diff.entries | selectattr('kind', 'equalto', 'regressed') | list %}
+  {% if regressions %}
+  <h3>Regressions</h3>
+  <table>
+    <thead><tr><th>Case</th><th>Executor</th><th class="n">Score</th></tr></thead>
+    <tbody>
+      {% for entry in regressions %}
+      <tr>
+        <td>{{ entry.title }}</td>
+        <td class="mono">{{ entry.executor_key }}</td>
+        <td class="n">
+          {%- if entry.score_delta is not none -%}
+            {{ '%+g' % entry.score_delta }}
+          {%- else -%}—{%- endif -%}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</div>
+{% endif %}
+
+{% if failures %}
+<h2>What failed</h2>
+<div class="card">
+  {% for item in failures %}
+  <details>
+    <summary>
+      <span class="pill {{ 'error' if item.status == 'error' else 'fail' }}">
+        {{ 'error' if item.status == 'error' else 'fail' }}
+      </span>
+      {{ item.title }}
+      <span class="mono" style="color:var(--muted)">· {{ item.executor_key }}</span>
+    </summary>
+    <pre>{{ item.error or 'Scored as failing. Open the item in Gaugix for the per-scorer rationale.' }}</pre>
+  </details>
+  {% endfor %}
+  {% if failures | length >= 200 %}
+  <p class="rule-note">Showing the first 200 failures.</p>
+  {% endif %}
+</div>
+{% endif %}
+
+<footer>
+  <p><strong>Methodology.</strong> Every number above was computed from stored run
+  items, their non-superseded attempts and their latest scores. Nothing is
+  estimated or smoothed.</p>
+  <dl>
+    <dt>Executors</dt>
+    {% for snapshot in executors %}
+    <dd class="mono">{{ snapshot.key }} — {{ snapshot.model.provider }}/{{ snapshot.model.model_id }},
+      harness {{ snapshot.harness.kind }}</dd>
+    {% else %}
+    <dd>—</dd>
+    {% endfor %}
+
+    <dt>Scorers used</dt>
+    <dd>{{ scorer_kinds | join(', ') if scorer_kinds else 'none' }}</dd>
+
+    {#
+      Which dataset, at which revision, scored by which method version. This is
+      the block that turns "we ran IFEval in August" into a checkable claim —
+      and the one that says, in the file itself, when the number is a Gaugix
+      adaptation rather than the published metric.
+    #}
+    {% for data in datasets | default([]) %}
+    <dt>Dataset — {{ data.set_name }}</dt>
+    <dd>
+      {{ data.benchmark }}{% if data.scope %} ({{ data.scope }}{% if data.sample_seed is not none %}, seed {{ data.sample_seed }}{% endif %}){% endif %}
+      · licence {{ data.licence or 'unstated' }}
+      {%- if data.legacy %}
+      <br><strong>Installed before Gaugix recorded provenance.</strong> The benchmark is known from
+      the set's tags; the source revision and the scoring method behind this number are not
+      recorded, so it cannot be checked against published scores. Reinstall from the catalogue to
+      get a citable record.
+      {%- else %}
+      · method {{ data.fidelity }} v{{ data.method_version }}
+      {%- if data.comparable is sameas false %}, <strong>not comparable with published scores</strong>{% endif %}.
+      {%- endif %}
+      {% if data.modified %}<br><strong>This set had been changed since it was installed</strong> —
+        {{ data.modified_reasons | join(' ') }} Its results describe these cases, not the published benchmark.{% endif %}
+      {% if data.revision %}<br><span class="mono">revision {{ data.revision }}</span>{% endif %}
+      {% if data.sha256 %}<br><span class="mono">sha256 {{ data.sha256 }}</span>{% endif %}
+      {% if data.installed_at %}<br>installed {{ data.installed_at }}{% endif %}
+    </dd>
+    {% endfor %}
+
+    {% if judge_note %}
+    <dt>Judge</dt>
+    <dd>{{ judge_note }}</dd>
+    {% endif %}
+
+    <dt>Calls</dt>
+    <dd>{{ attempt_count }} model {{ 'call' if attempt_count == 1 else 'calls' }} recorded
+      {%- if totals.cost_unknown %}; some could not be priced{% endif %}.</dd>
+
+    <dt>Pass rate</dt>
+    <dd>passed ÷ scored. Items with no resolved scorer are excluded from both.</dd>
+  </dl>
+  <p style="margin-top:18px">Generated by Gaugix {{ version }} · {{ generated_at }}</p>
+</footer>
+
+</div>
+</body>
+</html>
