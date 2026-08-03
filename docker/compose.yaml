@@ -1,0 +1,64 @@
+name: gaugix
+
+services:
+  gaugix:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: gaugix:0.1.0
+    restart: unless-stopped
+
+    # The published address is the security boundary. 127.0.0.1 keeps Gaugix
+    # reachable only from this machine, which is the deployment posture
+    # SECURITY.md describes — the app has no authentication layer. Widening
+    # this to "8317:8317" exposes an unauthenticated app to your whole LAN.
+    #
+    # Set GAUGIX_HOST_PORT in your shell if 8317 is already taken — a `make
+    # dev-api` running outside Docker holds exactly this port:
+    #     GAUGIX_HOST_PORT=18317 docker compose -f docker/compose.yaml up -d
+    ports:
+      - "127.0.0.1:${GAUGIX_HOST_PORT:-8317}:8317"
+
+    # Provider keys come from the repo-root .env, read from the host at start
+    # time and never baked into an image layer. Optional: the bundled fake
+    # executors need no key at all.
+    env_file:
+      - path: ../.env
+        required: false
+
+    environment:
+      GAUGIX_DATA_DIR: /data
+      GAUGIX_PORT: "8317"
+      GAUGIX_PROVIDER_CONCURRENCY: "4"
+      # Structured stdout logs, which is usually what you want off a workstation.
+      # GAUGIX_LOG_JSON: "1"
+      # Load the offline demo the first time the volume is empty. Never touches
+      # an existing database.
+      # GAUGIX_SEED_ON_EMPTY: "1"
+
+    volumes:
+      - gaugix-data:/data
+
+    # CLI executors and Python scorers spawn child processes; init reaps them
+    # instead of leaving zombies parented to PID 1.
+    init: true
+
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import json, urllib.request
+          raise SystemExit(0 if json.load(urllib.request.urlopen("http://127.0.0.1:8317/api/health", timeout=4))["status"] == "ok" else 1)
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+volumes:
+  # Named volume rather than a bind mount by default: SQLite in WAL mode is
+  # sensitive to the file-locking semantics of the virtualised filesystems that
+  # back bind mounts on macOS and Windows. docker/README.md covers switching to
+  # a bind mount when you want the files directly on the host.
+  gaugix-data:

@@ -1,0 +1,50 @@
+# Build-context exclusions. Keeping this tight matters twice over: it keeps the
+# context small, and it keeps secrets and host-only state out of image layers.
+
+# --- secrets (never in a layer; compose reads .env from the host at runtime) --
+.env
+.env.local
+*.pem
+
+# --- app data (belongs in the /data volume, not the image) -------------------
+data/
+.e2e-data/
+.demo-studio/
+.gaugix-smoke-calls
+
+# --- dependency trees (rebuilt inside the image from the lock files) ---------
+**/node_modules/
+**/.venv/
+frontend/dist/
+
+# --- vcs / ci ----------------------------------------------------------------
+.git/
+.github/
+.claude/
+
+# --- python caches -----------------------------------------------------------
+**/__pycache__/
+**/*.py[cod]
+**/*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- test + tooling output ---------------------------------------------------
+test-results/
+playwright-report/
+blob-report/
+.playwright-mcp/
+**/*.tsbuildinfo
+
+# --- docs and screenshots (not needed at runtime) ----------------------------
+docs/
+
+# --- os / editors ------------------------------------------------------------
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/

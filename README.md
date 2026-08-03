@@ -55,6 +55,8 @@ Set history is scoped to the selected set even when a run contains multiple sets
 - [uv](https://docs.astral.sh/uv/getting-started/installation/)
 - npm and GNU Make
 
+Or, to skip all of the above, [run it in Docker](#run-in-docker).
+
 ### Run the offline demo
 
 ```bash
@@ -96,6 +98,29 @@ make dev-api
 ```
 
 The built UI is served by FastAPI at [http://127.0.0.1:8317](http://127.0.0.1:8317).
+
+### Run in Docker
+
+Docker needs no Python, Node, uv, or Make on the host — only Docker with Compose v2.
+
+```bash
+git clone https://github.com/ethannortharc/gaugix.git
+cd gaugix
+
+docker compose -f docker/compose.yaml up -d --build
+```
+
+Open [http://127.0.0.1:8317](http://127.0.0.1:8317). Set `GAUGIX_HOST_PORT` if that port is taken.
+
+The image runs the same single-process mode as `make build && make dev-api`: one container serving both the API and the UI. Evaluation data — database, artifacts, exports, backups — lives in a Docker volume mounted at `/data`, so rebuilding or upgrading the image never touches it. Provider keys are read from your `.env` at start time and are never baked into an image layer.
+
+To load the offline demo into the container:
+
+```bash
+GAUGIX_FORCE=1 make docker-seed
+```
+
+The port is published to `127.0.0.1` by default, which keeps an application that has no authentication layer reachable only from your own machine. [docker/README.md](docker/README.md) covers data persistence, backups, upgrades, host directories instead of volumes, and what changes if you publish that port more widely.
 
 ## Core concepts
 
@@ -170,11 +195,16 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the detailed data model and
 | `make seed` | Reset the configured data directory and load synthetic demo data. |
 | `make backup` | Create a consistent database + artifact archive without `.env`. |
 | `make smoke` | Make explicitly capped real-model smoke calls; this may spend money. |
+| `make docker-up` | Build and start the container; see [docker/README.md](docker/README.md). |
+| `make docker-down` | Stop and remove the container, keeping the data volume. |
+| `make docker-logs` | Follow the container log. |
+| `make docker-seed` | Reset the container's data volume and load demo data. |
 
 ## Data and security
 
 - Gaugix is a local, single-user application and has **no authentication layer**. Do not expose its port to an untrusted network.
-- `.env`, SQLite data, artifacts, logs, exports, and backups are excluded from Git.
+- Under Docker the published port is that boundary, not the container's internal bind address. The bundled Compose file publishes to `127.0.0.1` only.
+- `.env`, SQLite data, artifacts, logs, exports, and backups are excluded from Git, and `.env` is excluded from the Docker build context.
 - API keys are read from the environment and are not stored in the database or included in reports.
 - HTML artifacts render in sandboxed iframes.
 - Python scorers and explicit artifact execution run local code. Treat imported scorers and generated artifacts as untrusted code and review them before execution.

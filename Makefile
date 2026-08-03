@@ -13,13 +13,18 @@ NPM      := npm --prefix $(FRONTEND)
 PORT     ?= 8317
 VITE_PORT ?= 5173
 
+# Compose v2 ships either as a `docker` subcommand or as a standalone binary.
+COMPOSE_BIN := $(shell if docker compose version >/dev/null 2>&1; then echo "docker compose"; else echo "docker-compose"; fi)
+COMPOSE  := $(COMPOSE_BIN) -f docker/compose.yaml
+
 # Colours only when attached to a terminal.
 BOLD := $(shell tput bold 2>/dev/null)
 DIM  := $(shell tput dim 2>/dev/null)
 RST  := $(shell tput sgr0 2>/dev/null)
 
 .PHONY: help setup dev dev-api dev-web check check-backend check-frontend test test-frontend \
-        lint fmt typecheck e2e seed smoke build backup clean
+        lint fmt typecheck e2e seed smoke build backup clean \
+        docker-up docker-down docker-logs docker-seed
 
 help: ## Show available targets
 	@echo "$(BOLD)Gaugix$(RST) — local-first LLM evaluation workbench"
@@ -136,6 +141,34 @@ backup: ## Zip the database + artifacts (excludes .env; restore doc inside)
 build: ## Build the frontend; the API then serves it at http://127.0.0.1:8317
 	@$(NPM) run build
 	@echo "$(BOLD)✓ built$(RST) → run: make dev-api  (UI at http://127.0.0.1:$(PORT))"
+
+# ---------------------------------------------------------------------------
+# docker  (see docker/README.md; data lives in a volume, not in data/)
+# ---------------------------------------------------------------------------
+
+docker-up: ## Build and start the container (GAUGIX_HOST_PORT=... to change the port)
+	@$(COMPOSE) up -d --build
+	@echo "$(BOLD)✓ up$(RST) → http://127.0.0.1:$${GAUGIX_HOST_PORT:-$(PORT)}"
+
+docker-down: ## Stop and remove the container (keeps the data volume)
+	@$(COMPOSE) down
+	@echo "$(DIM)data volume kept; 'docker compose -f docker/compose.yaml down -v' deletes it$(RST)"
+
+docker-logs: ## Follow the container log
+	@$(COMPOSE) logs -f
+
+docker-seed: ## Reset the container's data volume and load demo data
+	@if [ "$$GAUGIX_FORCE" != "1" ]; then \
+	  echo "docker-seed deletes everything in the Gaugix data volume."; \
+	  echo "Re-run with GAUGIX_FORCE=1 to confirm:"; \
+	  echo ""; \
+	  echo "    GAUGIX_FORCE=1 make docker-seed"; \
+	  echo ""; \
+	  exit 2; \
+	fi
+	@$(COMPOSE) stop
+	@$(COMPOSE) run --rm -e GAUGIX_FORCE=1 gaugix seed
+	@$(COMPOSE) start
 
 clean: ## Remove build outputs and caches (never touches data/)
 	@rm -rf $(FRONTEND)/dist $(FRONTEND)/node_modules/.tmp
