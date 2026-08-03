@@ -462,10 +462,19 @@ def seed_database(session: Session) -> dict[str, int]:
 
 
 def reset_data_dir(settings: Settings) -> None:
-    """Delete and recreate the data directory. Destructive by design."""
+    """Empty the data directory and rebuild its layout. Destructive by design.
+
+    The *contents* are removed rather than the directory itself: a data
+    directory is often a mount point — a Docker volume, an external disk — and
+    a mount point cannot be unlinked from the inside, only emptied.
+    """
     data_dir = settings.resolved_data_dir
-    if data_dir.exists():
-        shutil.rmtree(data_dir)
+    if data_dir.is_dir():
+        for entry in data_dir.iterdir():
+            if entry.is_dir() and not entry.is_symlink():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink()
     settings.ensure_dirs()
 
 
