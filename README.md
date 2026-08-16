@@ -90,6 +90,30 @@ OPENROUTER_API_KEY=
 
 Then open **Executors** and create a model profile, harness profile, and executor. Gaugix also supports CLI executors for evaluating a local command instead of calling a model API directly.
 
+When the OpenAI-compatible endpoint is itself a policy gateway, a refusal may be
+the expected result rather than a failed invocation. Keep the Direct harness's
+default behaviour for ordinary model APIs. For a gateway executor, opt in to the
+exact structured errors that should become scorer-visible output:
+
+```json
+{
+  "capture_http_errors": {
+    "status_codes": [403],
+    "error_codes": ["guardrails_blocked"]
+  },
+  "request_headers_from_env": {
+    "x-mt-vk": "MT0_EVAL_VK"
+  }
+}
+```
+
+The match requires both the HTTP status and `error.code`; an authentication 403,
+rate limit, or server error remains an execution error. Header values are resolved
+from the Gaugix process environment at invocation time and are never stored in the
+harness profile or frozen run configuration. For this opt-in OpenAI-compatible
+case, Gaugix sends the HTTP request directly so an adapter cannot discard the
+structured error body; ordinary Direct harness calls continue to use LiteLLM.
+
 For a single-process production-style build:
 
 ```bash

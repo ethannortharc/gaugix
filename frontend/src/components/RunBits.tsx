@@ -71,11 +71,23 @@ const RUN_META: Record<RunStatus, { variant: React.ComponentProps<typeof Badge>[
   interrupted: { variant: 'error' },
 }
 
-export function RunStatusBadge({ status }: { status: RunStatus }) {
+export function RunStatusBadge({
+  status,
+  executionErrors = 0,
+}: {
+  status: RunStatus
+  executionErrors?: number
+}) {
+  const completedWithErrors = status === 'completed' && executionErrors > 0
+  const variant = completedWithErrors ? 'error' : RUN_META[status].variant
+  const label = completedWithErrors
+    ? `completed · ${executionErrors} ${executionErrors === 1 ? 'error' : 'errors'}`
+    : status
+
   return (
-    <Badge variant={RUN_META[status].variant} className="gap-1">
+    <Badge variant={variant} className="gap-1">
       {status === 'running' ? <Loader2 className="size-3 animate-spin" /> : null}
-      {status}
+      {label}
     </Badge>
   )
 }
@@ -198,7 +210,17 @@ export function RunTotalsRow({ totals }: { totals: RunTotals }) {
           />
         ) : null}
         <Stat
-          label="pass rate"
+          label="scored coverage"
+          value={`${totals.scored} / ${totals.items}`}
+          tone={totals.error > 0 ? 'error' : undefined}
+          hint={
+            totals.items === 0
+              ? 'This run has no items.'
+              : `${Math.round((totals.scored / totals.items) * 100)}% of all run items received a verdict. Execution errors are not scored.`
+          }
+        />
+        <Stat
+          label="scored pass rate"
           value={passRate === null ? '—' : `${Math.round(passRate * 100)}%`}
           hint={
             totals.scored === 0

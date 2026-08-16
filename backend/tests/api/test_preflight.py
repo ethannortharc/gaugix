@@ -11,13 +11,14 @@ from tests.api.test_cases import make_set
 from tests.api.test_runs import make_fake_stack
 
 
-async def make_case(client, set_id, title="A case", scoring=None):
+async def make_case(client, set_id, title="A case", scoring=None, tags=None):
     response = await client.post(
         "/api/v1/cases",
         json={
             "title": title,
             "input": [{"role": "user", "content": "hi"}],
             "scoring": scoring if scoring is not None else [],
+            "tags": tags if tags is not None else [],
             "set_id": set_id,
         },
     )
@@ -51,6 +52,170 @@ async def test_a_healthy_run_passes_with_nothing_to_say(client):
     assert body["ok"] is True
     assert codes(body, "blocker") == []
     assert body["item_count"] == 1
+
+
+async def make_direct_stack(
+    client, name, *, adapter=None, capture=False, provider="openai_compatible"
+):
+    model = await client.post(
+        "/api/v1/model-profiles",
+        json={
+            "name": f"{name}-model",
+            "provider": provider,
+            "model_id": "subject",
+            **({"base_url": "http://gateway.test/v1"} if provider == "openai_compatible" else {}),
+        },
+    )
+    assert model.status_code == 201, model.text
+    config: dict[str, object] = {} if adapter is None else {"output_adapter": adapter}
+    if capture:
+        config["capture_http_errors"] = {
+            "status_codes": [403],
+            "error_codes": ["guardrails_blocked"],
+        }
+    harness = await client.post(
+        "/api/v1/harness-profiles",
+        json={"name": f"{name}-harness", "kind": "direct", "config": config},
+    )
+    assert harness.status_code == 201, harness.text
+    executor = await client.post(
+        "/api/v1/executors",
+        json={
+            "name": name,
+            "model_profile_id": model.json()["id"],
+            "harness_profile_id": harness.json()["id"],
+        },
+    )
+    assert executor.status_code == 201, executor.text
+    return executor.json()
+
+
+VERDICT_SCORER = [
+    {
+        "type": "json_schema",
+        "params": {
+            "extract_json": True,
+            "schema": {
+                "type": "object",
+                "required": ["verdict"],
+                "properties": {"verdict": {"enum": ["allowed", "blocked"]}},
+            },
+        },
+        "required": True,
+        "weight": 1,
+    }
+]
+
+
+async def test_raw_direct_executor_cannot_run_a_guardrail_verdict_set(client):
+    eval_set = await make_set(client, name="Guardrail contract")
+    await make_case(client, eval_set["id"], scoring=VERDICT_SCORER)
+    executor = await make_direct_stack(client, "raw-direct")
+
+    body = await run_preflight(client, [eval_set["id"]], [executor["id"]])
+
+    assert body["ok"] is False
+    assert "output_contract_mismatch" in codes(body, "blocker")
+
+
+async def test_adapted_direct_executor_satisfies_a_guardrail_verdict_set(client):
+    eval_set = await make_set(client, name="Guardrail contract")
+    await make_case(client, eval_set["id"], scoring=VERDICT_SCORER)
+    executor = await make_direct_stack(client, "adapted-direct", adapter="guardrail_verdict_v1")
+
+    body = await run_preflight(client, [eval_set["id"]], [executor["id"]])
+
+    assert "output_contract_mismatch" not in codes(body)
+
+
+BLOCKED_VERDICT_SCORER = [
+    {
+        "type": "json_schema",
+        "params": {
+            "extract_json": True,
+            "schema": {
+                "type": "object",
+                "required": ["verdict"],
+                "properties": {"verdict": {"const": "blocked"}},
+            },
+        },
+        "required": True,
+        "weight": 1,
+    }
+]
+
+
+async def test_adapted_direct_executor_must_capture_expected_policy_refusals(client):
+    eval_set = await make_set(client, name="Blocked Guardrail contract")
+    await make_case(client, eval_set["id"], scoring=BLOCKED_VERDICT_SCORER)
+    executor = await make_direct_stack(
+        client, "adapted-without-capture", adapter="guardrail_verdict_v1"
+    )
+
+    body = await run_preflight(client, [eval_set["id"]], [executor["id"]])
+
+    assert body["ok"] is False
+    assert "guardrail_capture_mismatch" in codes(body, "blocker")
+
+
+async def test_capture_policy_satisfies_an_expected_block_contract(client):
+    eval_set = await make_set(client, name="Captured Guardrail contract")
+    await make_case(client, eval_set["id"], scoring=BLOCKED_VERDICT_SCORER)
+    executor = await make_direct_stack(
+        client,
+        "adapted-with-capture",
+        adapter="guardrail_verdict_v1",
+        capture=True,
+    )
+
+    body = await run_preflight(client, [eval_set["id"]], [executor["id"]])
+
+    assert "guardrail_capture_mismatch" not in codes(body)
+
+
+async def test_optional_generic_verdict_property_does_not_block_raw_direct(client):
+    eval_set = await make_set(client, name="Optional generic verdict")
+    optional_verdict = [
+        {
+            "type": "json_schema",
+            "params": {
+                "schema": {
+                    "type": "object",
+                    "properties": {"verdict": {"type": "string"}},
+                }
+            },
+            "required": True,
+            "weight": 1,
+        }
+    ]
+    await make_case(client, eval_set["id"], scoring=optional_verdict)
+    executor = await make_direct_stack(client, "raw-optional-verdict")
+
+    body = await run_preflight(client, [eval_set["id"]], [executor["id"]])
+
+    assert "output_contract_mismatch" not in codes(body)
+
+
+async def test_stub_cases_cannot_be_run_with_a_real_model(client):
+    eval_set = await make_set(client, name="Needs stub")
+    await make_case(client, eval_set["id"], scoring=VERDICT_SCORER, tags=["needs:stub"])
+    executor = await make_direct_stack(client, "real-direct", adapter="guardrail_verdict_v1")
+
+    body = await run_preflight(client, [eval_set["id"]], [executor["id"]])
+
+    assert body["ok"] is False
+    assert "stub_requirement_mismatch" in codes(body, "blocker")
+
+
+async def test_real_api_cases_cannot_be_run_with_a_fake_profile(client):
+    eval_set = await make_set(client, name="Needs real API")
+    await make_case(client, eval_set["id"], scoring=CONTAINS, tags=["no-stub"])
+    stack = await make_fake_stack(client, "fake", {"mode": "echo"})
+
+    body = await run_preflight(client, [eval_set["id"]], [stack["executor"]["id"]])
+
+    assert body["ok"] is False
+    assert "real_api_requirement_mismatch" in codes(body, "blocker")
 
 
 async def test_an_empty_selection_is_a_blocker_rather_than_a_crash(client):

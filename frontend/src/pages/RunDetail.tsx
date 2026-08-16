@@ -129,7 +129,7 @@ export default function RunDetailPage() {
               </Link>
             </Button>
             {run.name}
-            <RunStatusBadge status={run.status} />
+            <RunStatusBadge status={run.status} executionErrors={run.totals.error} />
             {run.is_baseline_for.length > 0 ? (
               <Tooltip label="Regression diffs compare against this run.">
                 <Badge variant="primary" className="gap-1">

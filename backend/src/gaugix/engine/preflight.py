@@ -26,10 +26,10 @@ from dataclasses import dataclass, field
 import jsonschema
 from sqlmodel import Session, col, select
 
-from gaugix.domain import Pricing, ScorerSpec, ScorerType
+from gaugix.domain import HarnessKind, Pricing, Provider, ScorerSpec, ScorerType
 from gaugix.engine.planner import resolve_scoring
 from gaugix.models.cases import EvalCase, EvalSet, SetMembership
-from gaugix.models.executors import Executor, ModelProfile
+from gaugix.models.executors import Executor, HarnessProfile, ModelProfile
 from gaugix.scoring.aggregate import NAMED_SCALES, scale_bounds
 from gaugix.scoring.judge import class_config, threshold_value
 from gaugix.scoring.judge_config import resolve_judge_executor
@@ -117,6 +117,7 @@ def preflight(
 
     _check_subset(session, result, sets, cases_by_set, case_ids)
     _check_credentials(result, executors)
+    _check_executor_compatibility(result, sets, cases_by_set, executors)
     judge_specs = _check_scorers(session, result, sets, cases_by_set, executors, auto_score)
     _check_duplicates(result, sets, cases_by_set)
     _check_pricing(result, executors)
@@ -155,6 +156,7 @@ def _cases_in_set(
 class _ExecutorInfo:
     name: str
     model: ModelProfile
+    harness: HarnessProfile
 
 
 def _executors(session: Session, executor_ids: list[int]) -> list[_ExecutorInfo]:
@@ -167,8 +169,9 @@ def _executors(session: Session, executor_ids: list[int]) -> list[_ExecutorInfo]
         if executor is None:
             continue
         model = session.get(ModelProfile, executor.model_profile_id)
-        if model is not None:
-            out.append(_ExecutorInfo(name=executor.name, model=model))
+        harness = session.get(HarnessProfile, executor.harness_profile_id)
+        if model is not None and harness is not None:
+            out.append(_ExecutorInfo(name=executor.name, model=model, harness=harness))
     return out
 
 
@@ -239,6 +242,152 @@ def _check_credentials(result: Preflight, executors: list[_ExecutorInfo]) -> Non
                 ),
             )
         )
+
+
+def _check_executor_compatibility(
+    result: Preflight,
+    sets: list[EvalSet],
+    cases_by_set: dict[int | None, list[EvalCase]],
+    executors: list[_ExecutorInfo],
+) -> None:
+    """Refuse pairings whose output or environment contract cannot satisfy the set.
+
+    These are configuration failures, not model-quality failures.  Letting them
+    run produces a very convincing 0% report even though every HTTP call may have
+    succeeded.  Tags express environment requirements; scorer schemas express
+    the output contract actually consumed by Gaugix.
+    """
+    cases = [case for eval_set in sets for case in cases_by_set.get(eval_set.id, [])]
+    verdict_cases = [
+        case
+        for eval_set in sets
+        for case in cases_by_set.get(eval_set.id, [])
+        if _requires_guardrail_verdict(case, eval_set)
+    ]
+    blocked_verdict_cases = [
+        case
+        for eval_set in sets
+        for case in cases_by_set.get(eval_set.id, [])
+        if _expects_blocked_guardrail_verdict(case, eval_set)
+    ]
+    stub_cases = [case for case in cases if "needs:stub" in case.tags]
+    real_cases = [case for case in cases if "no-stub" in case.tags]
+
+    for executor in executors:
+        if (
+            verdict_cases
+            and executor.harness.kind == str(HarnessKind.direct)
+            and executor.harness.config.get("output_adapter") != "guardrail_verdict_v1"
+        ):
+            result.findings.append(
+                Finding(
+                    BLOCKER,
+                    "output_contract_mismatch",
+                    f"{executor.name} returns raw model/API text, but the selected cases "
+                    "require the Guardrail verdict contract.",
+                    detail=(
+                        "Use a CLI probe executor or configure the Direct harness with "
+                        "output_adapter=guardrail_verdict_v1. Otherwise fields such as "
+                        "verdict, rule_id and method cannot be scored."
+                    ),
+                    count=len(verdict_cases),
+                )
+            )
+
+        capture = executor.harness.config.get("capture_http_errors")
+        captures_guardrail_block = (
+            isinstance(capture, dict)
+            and 403 in (capture.get("status_codes") or [])
+            and "guardrails_blocked" in (capture.get("error_codes") or [])
+        )
+        if (
+            blocked_verdict_cases
+            and executor.harness.kind == str(HarnessKind.direct)
+            and executor.harness.config.get("output_adapter") == "guardrail_verdict_v1"
+            and not captures_guardrail_block
+        ):
+            result.findings.append(
+                Finding(
+                    BLOCKER,
+                    "guardrail_capture_mismatch",
+                    f"{executor.name} adapts successful output, but cannot capture the "
+                    "structured policy refusals expected by the selected cases.",
+                    detail=(
+                        "Configure capture_http_errors with status_codes=[403] and "
+                        "error_codes=['guardrails_blocked']. Otherwise expected blocks "
+                        "become execution errors instead of guardrail-verdict/v1 output."
+                    ),
+                    count=len(blocked_verdict_cases),
+                )
+            )
+
+        if stub_cases and executor.model.provider != str(Provider.fake):
+            result.findings.append(
+                Finding(
+                    BLOCKER,
+                    "stub_requirement_mismatch",
+                    f"{executor.name} uses a real model, but {len(stub_cases)} selected "
+                    "case(s) require the deterministic stub stack.",
+                    detail=(
+                        "Choose the mt0 Guardrail probe executor and materialize the matching "
+                        "policy first, or choose a no-stub real-API set. A real upstream changes "
+                        "output-side assertions and makes this comparison invalid."
+                    ),
+                    count=len(stub_cases),
+                )
+            )
+
+        if real_cases and executor.model.provider == str(Provider.fake):
+            result.findings.append(
+                Finding(
+                    BLOCKER,
+                    "real_api_requirement_mismatch",
+                    f"{executor.name} is a fake/stub model profile, but {len(real_cases)} "
+                    "selected case(s) require real API calls.",
+                    detail="Choose a real-API executor for sets tagged no-stub.",
+                    count=len(real_cases),
+                )
+            )
+
+
+def _requires_guardrail_verdict(case: EvalCase, eval_set: EvalSet) -> bool:
+    """Whether resolved JSON-schema scoring consumes the canonical verdict object."""
+    if "contract:guardrail-verdict-v1" in case.tags:
+        return True
+    specs = resolve_scoring(case, eval_set)
+    for spec in specs:
+        if spec.type != ScorerType.json_schema:
+            continue
+        schema = spec.params.get("schema")
+        if not isinstance(schema, dict):
+            continue
+        required = schema.get("required")
+        if isinstance(required, list) and "verdict" in required:
+            return True
+    return False
+
+
+def _expects_blocked_guardrail_verdict(case: EvalCase, eval_set: EvalSet) -> bool:
+    """Whether a case requires a captured structured policy refusal."""
+    if "expect:block" in case.tags:
+        return _requires_guardrail_verdict(case, eval_set)
+    for spec in resolve_scoring(case, eval_set):
+        if spec.type != ScorerType.json_schema:
+            continue
+        schema = spec.params.get("schema")
+        if not isinstance(schema, dict):
+            continue
+        required = schema.get("required")
+        properties = schema.get("properties")
+        verdict = properties.get("verdict") if isinstance(properties, dict) else None
+        if (
+            isinstance(required, list)
+            and "verdict" in required
+            and isinstance(verdict, dict)
+            and verdict.get("const") == "blocked"
+        ):
+            return True
+    return False
 
 
 def _check_scorers(

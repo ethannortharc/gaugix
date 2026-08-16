@@ -141,7 +141,7 @@ export default function DashboardPage() {
                     >
                       {run.name}
                     </Link>
-                    <RunStatusBadge status={run.status} />
+                    <RunStatusBadge status={run.status} executionErrors={run.totals.error} />
                     <span className="tabular text-xs text-[var(--muted-foreground)]">
                       {run.resumable_items} left
                     </span>
@@ -206,9 +206,14 @@ export default function DashboardPage() {
                       {run.is_baseline_for.length > 0 ? (
                         <Badge variant="primary">baseline</Badge>
                       ) : null}
-                      <RunStatusBadge status={run.status} />
-                      <span className="tabular w-24 text-right text-xs">
-                        {rate === null ? '—' : `${Math.round(rate * 100)}% pass`}
+                      <RunStatusBadge status={run.status} executionErrors={run.totals.error} />
+                      <span className="tabular w-28 text-right text-xs">
+                        <span className="block">
+                          {rate === null ? '—' : `${Math.round(rate * 100)}% pass`}
+                        </span>
+                        <span className="block text-[11px] text-[var(--muted-foreground)]">
+                          {run.totals.scored}/{run.totals.items} scored
+                        </span>
                       </span>
                       {/*
                         A run with an unpriced model reported `$0.00` here and

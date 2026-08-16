@@ -382,6 +382,13 @@ def _validate_harness(kind: HarnessKind, config: dict[str, object]) -> None:
             raise ValidationError("cli harness requires a command_template")
         if "{prompt_file}" not in template:
             raise ValidationError("command_template must contain {prompt_file}")
+    if kind is HarnessKind.direct:
+        from gaugix.harness.direct import validate_direct_harness_config
+
+        try:
+            validate_direct_harness_config(config)
+        except HarnessError as exc:
+            raise ValidationError(exc.message) from exc
 
 
 # -- executors -----------------------------------------------------------------

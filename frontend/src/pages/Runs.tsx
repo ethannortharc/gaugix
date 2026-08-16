@@ -68,7 +68,7 @@ export default function RunsPage() {
                 <TableHead>Run</TableHead>
                 <TableHead className="w-32">Status</TableHead>
                 <TableHead className="w-24">Items</TableHead>
-                <TableHead className="w-32">Pass rate</TableHead>
+                <TableHead className="w-40">Scored pass rate</TableHead>
                 <TableHead className="w-24">Tokens</TableHead>
                 <TableHead className="w-24">Cost</TableHead>
                 <TableHead className="w-32">When</TableHead>
@@ -102,14 +102,25 @@ export default function RunsPage() {
                       </div>
                     </TableCell>
                     <TableCell>
-                      <RunStatusBadge status={run.status} />
+                      <RunStatusBadge status={run.status} executionErrors={run.totals.error} />
                     </TableCell>
                     <TableCell className="tabular text-sm">{run.totals.items}</TableCell>
                     <TableCell className="tabular text-sm">
                       {rate === null ? (
                         <span className="text-[var(--muted-foreground)]">—</span>
                       ) : (
-                        `${Math.round(rate * 100)}%`
+                        <>
+                          <div>{Math.round(rate * 100)}%</div>
+                          <div className="text-[11px] text-[var(--muted-foreground)]">
+                            {run.totals.scored}/{run.totals.items} scored
+                            {run.totals.error > 0 ? (
+                              <span className="text-[var(--error)]">
+                                {' '}
+                                · {run.totals.error} {pluralize(run.totals.error, 'error')}
+                              </span>
+                            ) : null}
+                          </div>
+                        </>
                       )}
                     </TableCell>
                     <TableCell className="tabular text-sm">

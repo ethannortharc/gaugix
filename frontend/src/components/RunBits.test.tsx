@@ -86,6 +86,11 @@ describe('RunStatusBadge', () => {
       unmount()
     }
   })
+
+  it('does not present a completed run with execution errors as clean', () => {
+    withProviders(<RunStatusBadge status="completed" executionErrors={7} />)
+    expect(screen.getByText('completed · 7 errors')).toBeInTheDocument()
+  })
 })
 
 describe('ScoreBadge', () => {
@@ -106,6 +111,7 @@ describe('RunTotalsRow', () => {
     // 7 passed + 3 failed = 10 scored → 70%. Errors must not dilute it.
     withProviders(<RunTotalsRow totals={totals({ error: 5, items: 15 })} />)
     expect(screen.getByText('70%')).toBeInTheDocument()
+    expect(screen.getByText('10 / 15')).toBeInTheDocument()
   })
 
   it('shows a dash rather than 0% when nothing has been scored', () => {
@@ -197,6 +203,7 @@ describe('RunTotalsRow — execution versus evaluation', () => {
     expect(screen.getByText('failed').parentElement).toHaveTextContent('4')
     expect(screen.getByText('unscored').parentElement).toHaveTextContent('1')
     // 4 of 8 scored, so 50% — and the unscored item is in neither term.
-    expect(screen.getByText('pass rate').parentElement).toHaveTextContent('50%')
+    expect(screen.getByText('scored coverage').parentElement).toHaveTextContent('8 / 9')
+    expect(screen.getByText('scored pass rate').parentElement).toHaveTextContent('50%')
   })
 })
