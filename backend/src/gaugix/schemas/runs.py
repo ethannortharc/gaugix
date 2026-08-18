@@ -228,6 +228,14 @@ class RerunFromResponse(BaseModel):
     message: str | None = None
 
 
+class RerunRequest(BaseModel):
+    """Optional fresh consent when a rerun newly requires code execution."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    accept_code_execution: bool = False
+
+
 class BaselineRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

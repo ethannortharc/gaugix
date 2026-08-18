@@ -9,6 +9,7 @@ from sqlmodel import select
 from tests.api.test_cases import make_set
 from tests.api.test_compare import (
     ALLOW_SCORER,
+    ALLOWS_EVERYTHING,
     BLOCK_SCORER,
     BLOCKS_EVERYTHING,
     fixture,
@@ -188,6 +189,35 @@ async def test_the_report_redacts_literal_credentials_from_frozen_executor(clien
     assert "[REDACTED]" in html
 
 
+async def test_the_report_redacts_credentials_from_case_title_and_tags(client):
+    secret = "sk-report-case-metadata-secret-123456"
+    eval_set = await make_set(client, name="Secret-safe case metadata")
+    created = await client.post(
+        "/api/v1/cases",
+        json={
+            "title": f"must fail api_key={secret}",
+            "input": [{"role": "user", "content": "safe input"}],
+            "tags": [f"credential:{secret}"],
+            "scoring": BLOCK_SCORER,
+            "set_id": eval_set["id"],
+        },
+    )
+    assert created.status_code == 201, created.text
+    stack = await make_fake_stack(client, "metadata-safe", ALLOWS_EVERYTHING)
+    run = (
+        await client.post(
+            "/api/v1/runs",
+            json={"set_ids": [eval_set["id"]], "executor_ids": [stack["executor"]["id"]]},
+        )
+    ).json()
+    await wait_for_run(client, run["id"])
+
+    html = await report_for_run(client, run["id"])
+
+    assert secret not in html
+    assert "[REDACTED]" in html
+
+
 async def test_the_report_redacts_derived_score_rationales(client, session):
     from gaugix.models.scores import Score
 
@@ -312,6 +342,52 @@ async def test_a_comparison_report_shows_the_regression_diff(client):
     assert "Expected result" in html
     assert "Actual result" in html
     assert "Frozen case and scoring configuration" in html
+
+
+async def test_comparison_report_and_apis_redact_case_titles(client):
+    secret = "sk-comparison-title-secret-123456"
+    eval_set = await make_set(client, name="Secret-safe comparison")
+    case = await make_case(client, eval_set["id"], f"regression api_key={secret}", BLOCK_SCORER)
+    stack = await make_fake_stack(client, "comparison-safe", BLOCKS_EVERYTHING)
+    executor_id = stack["executor"]["id"]
+    baseline = await wait_for_run(
+        client,
+        (
+            await client.post(
+                "/api/v1/runs",
+                json={"set_ids": [eval_set["id"]], "executor_ids": [executor_id]},
+            )
+        ).json()["id"],
+    )
+    patched = await client.patch(f"/api/v1/cases/{case['id']}", json={"scoring": ALLOW_SCORER})
+    assert patched.status_code == 200, patched.text
+    current = await wait_for_run(
+        client,
+        (
+            await client.post(
+                "/api/v1/runs",
+                json={"set_ids": [eval_set["id"]], "executor_ids": [executor_id]},
+            )
+        ).json()["id"],
+    )
+    report_params = {
+        "run_id": [baseline["id"], current["id"]],
+        "baseline_run_id": baseline["id"],
+    }
+
+    report = await client.get("/api/v1/compare/report", params=report_params)
+    diff = await client.get(
+        "/api/v1/compare/diff",
+        params={"run_id": current["id"], "baseline_run_id": baseline["id"]},
+    )
+    matrix = await client.get(
+        "/api/v1/compare/matrix", params={"run_id": [baseline["id"], current["id"]]}
+    )
+
+    assert report.status_code == diff.status_code == matrix.status_code == 200
+    for response in (report, diff, matrix):
+        assert secret not in response.text
+        assert "[REDACTED]" in response.text
 
 
 async def test_a_report_for_a_run_that_does_not_exist_is_a_404(client):

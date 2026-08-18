@@ -14,6 +14,7 @@ from gaugix.config import (
     provider_key_status,
     read_api_key,
     redact_for_display,
+    reset_settings_cache,
 )
 
 
@@ -85,6 +86,22 @@ def test_read_api_key_returns_none_for_missing_or_blank(monkeypatch):
 def test_read_api_key_strips_whitespace(monkeypatch):
     monkeypatch.setenv("SOME_KEY", "  value  ")
     assert read_api_key("SOME_KEY") == "value"
+
+
+def test_frozen_credentials_snapshot_lazily_and_status_uses_the_same_view(monkeypatch):
+    monkeypatch.setenv("GAUGIX_FREEZE_CREDENTIALS", "1")
+    monkeypatch.setenv("OPENAI_API_KEY", "first-credential-1234")
+    reset_settings_cache()
+    try:
+        assert read_api_key("OPENAI_API_KEY") == "first-credential-1234"
+        monkeypatch.setenv("OPENAI_API_KEY", "later-credential-9999")
+
+        assert read_api_key("OPENAI_API_KEY") == "first-credential-1234"
+        status = provider_key_status()
+        assert status["openai"]["present"] is True
+        assert status["openai"]["masked"] == "…1234"
+    finally:
+        reset_settings_cache()
 
 
 def test_redact_for_display_keeps_env_names_but_removes_literal_credentials():

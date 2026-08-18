@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
-from sqlmodel import Session, col, select
+from sqlmodel import Session, col, func, select
 
 from gaugix import __version__, coverage
 from gaugix.compare import (
@@ -112,13 +112,15 @@ def _run_context(session: Session, run: Run) -> dict[str, Any]:
         duration = (run.finished_at - run.started_at).total_seconds()
 
     failed_facts = [f for f in facts if f.verdict is False or f.status == "error"]
+    failures = _failure_details(session, failed_facts, [run])
     return {
         "run": run,
         "facts": facts,
         "leaderboard": board,
         "totals": board["totals"],
         "duration_s": duration,
-        "failures": _failure_details(session, failed_facts, [run]),
+        "failures": failures,
+        "failure_count": len(failed_facts),
         "charts": {
             "pass_rate": svg.bar_chart(
                 [(row["executor_key"], row["pass_rate"]) for row in board["rows"]],
@@ -206,7 +208,7 @@ def _failure_details(
             {
                 "run_id": fact.run_id,
                 "status": fact.status,
-                "title": fact.title,
+                "title": redact_for_display(fact.title),
                 "set_name": fact.set_name,
                 "executor_key": fact.executor_key,
                 "error": redact_for_display(fact.error),
@@ -222,7 +224,7 @@ def _failure_details(
                 "scoring": redact_for_display(
                     [spec.model_dump(mode="json") for spec in snapshot.scoring]
                 ),
-                "case_tags": snapshot.tags,
+                "case_tags": redact_for_display(snapshot.tags),
                 "case_notes": redact_for_display(snapshot.notes),
                 "executor": executors.get((fact.run_id, fact.executor_key)),
                 "provider_messages": (
@@ -317,12 +319,17 @@ def build_comparison_report(
     runs.sort(key=lambda r: run_ids.index(r.id or 0))
     facts = load_item_facts(session, run_ids)
     board = leaderboard(session, run_ids)
+    failed_facts = [f for f in facts if f.verdict is False or f.status == "error"]
+    failures = _failure_details(session, failed_facts, runs)
 
     diff = None
     delta_rows: list[tuple[str, float]] = []
     if baseline_run_id is not None and run_ids:
         current_id = next((r for r in run_ids if r != baseline_run_id), run_ids[0])
-        diff = diff_runs(session, current_id, baseline_run_id)
+        safe_diff = redact_for_display(diff_runs(session, current_id, baseline_run_id))
+        if not isinstance(safe_diff, dict):
+            raise TypeError("redacted comparison diff must remain an object")
+        diff = safe_diff
         delta_rows = [
             (entry["title"], entry["score_delta"])
             for entry in diff["entries"]
@@ -357,11 +364,8 @@ def build_comparison_report(
             attempt_count=_attempt_count(session, run_ids),
             pass_rate_overall=pass_rate(facts),
             mean_score_overall=mean_score(facts),
-            failures=_failure_details(
-                session,
-                [f for f in facts if f.verdict is False or f.status == "error"],
-                runs,
-            ),
+            failures=failures,
+            failure_count=len(failed_facts),
             charts={
                 "pass_rate": svg.bar_chart(
                     [(row["executor_key"], row["pass_rate"]) for row in board["rows"]],
@@ -379,9 +383,11 @@ def build_comparison_report(
 
 
 def _attempt_count(session: Session, run_ids: list[int]) -> int:
-    items = session.exec(select(RunItem).where(col(RunItem.run_id).in_(run_ids))).all()
-    item_ids = [item.id for item in items if item.id is not None]
-    if not item_ids:
-        return 0
-    attempts = session.exec(select(Attempt).where(col(Attempt.run_item_id).in_(item_ids))).all()
-    return len(attempts)
+    return int(
+        session.exec(
+            select(func.count())
+            .select_from(Attempt)
+            .join(RunItem, col(RunItem.id) == col(Attempt.run_item_id))
+            .where(col(RunItem.run_id).in_(run_ids))
+        ).one()
+    )

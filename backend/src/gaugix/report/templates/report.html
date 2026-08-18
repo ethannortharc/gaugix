@@ -326,8 +326,8 @@ footer dd { margin: 2px 0 0; }
     </div>
   </details>
   {% endfor %}
-  {% if failures | length >= 200 %}
-  <p class="rule-note">Showing the first 200 failures.</p>
+  {% if failure_count > (failures | length) %}
+  <p class="rule-note">Showing the first {{ failures | length }} of {{ failure_count }} failures.</p>
   {% endif %}
 </div>
 {% endif %}

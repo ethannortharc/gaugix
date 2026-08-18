@@ -39,6 +39,8 @@ class PlanRequest:
     #: Restrict the run to these cases. `None` means the whole of every chosen
     #: set; a list means "only these, wherever they appear in the selection".
     case_ids: list[int] | None = None
+    #: Freeze only an acknowledgement that the selected cases actually needed.
+    accepted_code_execution: bool = False
 
 
 @dataclass(slots=True)
@@ -194,6 +196,7 @@ def plan_run(session: Session, request: PlanRequest) -> PlannedRun:
         ],
         "concurrency": max(1, request.concurrency),
         "auto_score": request.auto_score,
+        **({"accepted_code_execution": True} if request.accepted_code_execution else {}),
         # Recorded so a rerun covers the same cases, and so the run page can say
         # "part of this set" rather than implying the whole of it. Absent on
         # whole-set runs, which keeps existing configs byte-identical.

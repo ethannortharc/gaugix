@@ -309,6 +309,33 @@ async def test_run_executes_to_completion(client):
     assert run["totals"]["passed"] == 3
 
 
+async def test_run_list_set_filter_uses_membership_not_json_id_prefixes(client):
+    stack = await make_fake_stack(client, "set-filter")
+    eval_sets = [await make_set(client, name=f"Filter set {i}") for i in range(10)]
+    first, tenth = eval_sets[0], eval_sets[9]
+    await make_case(client, title="First", set_id=first["id"])
+    await make_case(client, title="Tenth", set_id=tenth["id"])
+    first_run = (
+        await client.post(
+            "/api/v1/runs",
+            json={"set_ids": [first["id"]], "executor_ids": [stack["executor"]["id"]]},
+        )
+    ).json()
+    tenth_run = (
+        await client.post(
+            "/api/v1/runs",
+            json={"set_ids": [tenth["id"]], "executor_ids": [stack["executor"]["id"]]},
+        )
+    ).json()
+    await wait_for_run(client, first_run["id"])
+    await wait_for_run(client, tenth_run["id"])
+
+    response = await client.get("/api/v1/runs", params={"set_id": first["id"]})
+
+    assert response.headers["X-Total-Count"] == "1"
+    assert [row["id"] for row in response.json()] == [first_run["id"]]
+
+
 async def test_run_can_be_planned_without_starting(client):
     stack = await make_fake_stack(client)
     eval_set = await seeded_set(client, n=2)
@@ -947,6 +974,51 @@ async def test_retrying_one_item_leaves_the_rest_of_the_lane_alone(client):
     for other in items[1:]:
         other_detail = (await client.get(f"/api/v1/items/{other['id']}")).json()
         assert len(other_detail["attempts"]) == 1
+
+
+async def test_retrying_one_item_does_not_resume_other_errors_or_skips(client, session):
+    """A canceled diagnostic run may have hundreds of errors and skipped rows."""
+    from gaugix.domain import ItemStatus
+    from gaugix.models.runs import RunItem
+
+    eval_set = await make_set(client, name="Mixed retry states")
+    for i in range(3):
+        await make_case(client, title=f"Mixed {i}", set_id=eval_set["id"])
+    stack = await make_fake_stack(client, "mixed-retry")
+    run = await wait_for_run(
+        client,
+        (
+            await client.post(
+                "/api/v1/runs",
+                json={"set_ids": [eval_set["id"]], "executor_ids": [stack["executor"]["id"]]},
+            )
+        ).json()["id"],
+    )
+    items = (await client.get(f"/api/v1/runs/{run['id']}/items")).json()
+    target, unrelated_error, unrelated_skip = items
+    for item_id, status in (
+        (unrelated_error["id"], ItemStatus.error),
+        (unrelated_skip["id"], ItemStatus.skipped),
+    ):
+        row = session.get(RunItem, item_id)
+        assert row is not None
+        row.status = str(status)
+        session.add(row)
+    session.commit()
+
+    response = await client.post(f"/api/v1/runs/{run['id']}/items/{target['id']}/retry")
+    assert response.status_code == 200, response.text
+    finished = await wait_for_run(client, run["id"])
+
+    target_detail = (await client.get(f"/api/v1/items/{target['id']}")).json()
+    error_detail = (await client.get(f"/api/v1/items/{unrelated_error['id']}")).json()
+    skip_detail = (await client.get(f"/api/v1/items/{unrelated_skip['id']}")).json()
+    assert len(target_detail["attempts"]) == 2
+    assert len(error_detail["attempts"]) == 1
+    assert len(skip_detail["attempts"]) == 1
+    assert error_detail["status"] == "error"
+    assert skip_detail["status"] == "skipped"
+    assert finished["status"] == "canceled"
 
 
 async def test_retrying_an_item_from_another_run_is_a_404(client):

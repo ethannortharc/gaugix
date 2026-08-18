@@ -46,6 +46,7 @@ from gaugix.schemas.runs import (
     PreflightFinding,
     PreflightRead,
     RerunFromResponse,
+    RerunRequest,
     ResumeRequest,
     ResumeResponse,
     RunCreate,
@@ -341,6 +342,9 @@ async def create_run(payload: RunCreate, session: SessionDep) -> RunRead:
             auto_score=payload.auto_score,
             parent_run_id=payload.parent_run_id,
             case_ids=payload.case_ids,
+            accepted_code_execution=(
+                checks.requires_code_execution and payload.accept_code_execution
+            ),
         ),
     )
     run_id = planned.run.id or 0
@@ -370,9 +374,11 @@ def list_runs(
     if status:
         statement = statement.where(col(Run.status).in_(status))
     if set_id is not None:
-        statement = statement.where(col(Run.config_json).contains(f'"id": {set_id}'))
+        statement = statement.where(
+            col(Run.id).in_(select(RunItem.run_id).where(RunItem.set_id == set_id))
+        )
 
-    total = len(session.exec(statement).all())
+    total = session.exec(select(func.count()).select_from(statement.subquery())).one()
     rows = session.exec(statement.order_by(col(Run.id).desc()).limit(limit).offset(offset)).all()
     response.headers["X-Total-Count"] = str(total)
     counts = _resumable_counts(session, [r.id for r in rows if r.id is not None])
@@ -471,7 +477,7 @@ def list_run_items(
             )
         )
 
-    total = len(session.exec(statement).all())
+    total = session.exec(select(func.count()).select_from(statement.subquery())).one()
     rows = session.exec(
         statement.order_by(col(RunItem.executor_key), col(RunItem.position))
         .limit(limit)
@@ -723,7 +729,7 @@ async def retry_one_item(run_id: int, item_id: int, session: SessionDep) -> Reru
     except ValueError as exc:
         raise NotFoundError(str(exc)) from exc
 
-    await start_run(get_engine(), run_id)
+    await start_run(get_engine(), run_id, item_ids=[item_id])
     return RerunFromResponse(ok=True, affected=1, status=str(RunStatus.running))
 
 
@@ -744,12 +750,14 @@ async def rerun_from_item(run_id: int, item_id: int, session: SessionDep) -> Rer
             ok=False, affected=0, status="unchanged", message="nothing to rerun"
         )
 
-    await start_run(get_engine(), run_id)
+    await start_run(get_engine(), run_id, item_ids=reset)
     return RerunFromResponse(ok=True, affected=len(reset), status=str(RunStatus.running))
 
 
 @router.post("/runs/{run_id}/rerun", response_model=RunRead, status_code=201)
-async def rerun_whole_run(run_id: int, session: SessionDep) -> RunRead:
+async def rerun_whole_run(
+    run_id: int, session: SessionDep, payload: RerunRequest | None = None
+) -> RunRead:
     """Start a fresh run with the same sets and executors, linked as a child (PRD F3.7)."""
     parent = get_or_404(session, Run, run_id, "Run")
     config = parent.config
@@ -774,9 +782,13 @@ async def rerun_whole_run(run_id: int, session: SessionDep) -> RunRead:
             # A partial run reruns the same part. Rerunning the whole set instead
             # would silently change what the two runs compare.
             case_ids=config.get("case_ids"),
-            # The parent already carried this acknowledgement; a rerun of an
-            # accepted run must not stall on re-accepting it.
-            accept_code_execution=True,
+            # Only a parent that actually required and recorded this explicit
+            # acknowledgement may carry it forward. If the set gained a Python
+            # scorer later, create_run must stop and ask for fresh consent.
+            accept_code_execution=(
+                bool(config.get("accepted_code_execution", False))
+                or bool(payload and payload.accept_code_execution)
+            ),
         ),
         session,
     )

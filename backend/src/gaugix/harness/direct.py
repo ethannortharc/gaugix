@@ -11,16 +11,18 @@ silently corrupt a cost-per-quality comparison.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+import secrets
 import time
 from collections.abc import Mapping
 from typing import Any, cast
 
 import httpx
 
-from gaugix.config import read_api_key
+from gaugix.config import credential_environment, redact_for_display
 from gaugix.domain import (
     CaseSnapshot,
     HarnessError,
@@ -32,12 +34,16 @@ from gaugix.domain import (
     Provider,
     Usage,
 )
+from gaugix.logging_setup import get_logger
+
+log = get_logger("gaugix.harness.direct")
 
 #: Provider errors worth retrying (ARCHITECTURE §5). Matched against the exception
 #: class name and message, because litellm's exception hierarchy varies by provider.
 RETRYABLE_MARKERS = (
     "ratelimit",
     "rate_limit",
+    "rate limit",
     "timeout",
     "timedout",
     "serviceunavailable",
@@ -54,6 +60,7 @@ _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _HEADER_NAME = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 _FUNCTION_NAME = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _CASE_DIRECTIVE = re.compile(r"^\s*@gaugix\s+(\{.*\})\s*$", re.DOTALL)
+_FINGERPRINT_KEY = secrets.token_bytes(32)
 GUARDRAIL_VERDICT_V1 = "guardrail_verdict_v1"
 DEFAULT_TIMEOUT_S = 600.0
 MAX_CASE_OVERRIDE_BYTES = 32_768
@@ -127,6 +134,13 @@ def resolve_cost(
     return None
 
 
+def _secret_fingerprint(value: str | None) -> str:
+    """Return a process-local correlation id without enabling offline key guesses."""
+    if not value:
+        return "absent"
+    return hashlib.blake2b(value.encode(), key=_FINGERPRINT_KEY, digest_size=6).hexdigest()
+
+
 class DirectHarness:
     """Calls the provider's chat-completion API through litellm."""
 
@@ -138,10 +152,26 @@ class DirectHarness:
     async def invoke(
         self, case: CaseSnapshot, model: ModelSnapshot, ctx: InvokeContext
     ) -> InvocationResult:
+        # Keep one request internally consistent even if a development process
+        # rotates its environment concurrently. Production can opt into a
+        # process-wide immutable snapshot through GAUGIX_FREEZE_CREDENTIALS.
+        credential_env = dict(credential_environment())
+        credential_before_import = _secret_fingerprint(credential_env.get(model.api_key_env or ""))
         import litellm
+
+        credential_after_import = _secret_fingerprint(os.environ.get(model.api_key_env or ""))
 
         model_string = litellm_model_string(model)
         messages, case_params = case_request_overrides(case.messages_for_api(), ctx.harness_config)
+        if (
+            _capture_policy(ctx.harness_config) is not None
+            and Provider(model.provider) is not Provider.openai_compatible
+        ):
+            raise HarnessError(
+                "capture_http_errors requires an openai_compatible model profile",
+                retryable=False,
+                kind="config",
+            )
         params: dict[str, Any] = {
             **model.params,
             **(ctx.params or {}),
@@ -155,7 +185,7 @@ class DirectHarness:
                 retryable=False,
                 kind="config",
             )
-        env_headers = headers_from_env(ctx.harness_config)
+        env_headers = headers_from_env(ctx.harness_config, environment=credential_env)
 
         kwargs: dict[str, Any] = {"model": model_string, "messages": messages, **params}
         if env_headers:
@@ -170,12 +200,12 @@ class DirectHarness:
         if model.base_url:
             kwargs["base_url"] = model.base_url
         # litellm will not pick a key up from an arbitrary env var name, so pass it.
-        api_key = read_api_key(model.api_key_env)
+        api_key = (credential_env.get(model.api_key_env or "") or "").strip() or None
         if not api_key and Provider(model.provider) is Provider.openai_compatible:
             # Match LiteLLM's OpenAI-compatible fallback when a profile does not
             # name a custom key variable. Adding error capture must not silently
             # turn a previously authenticated executor into an anonymous one.
-            api_key = os.environ.get("OPENAI_API_KEY")
+            api_key = (credential_env.get("OPENAI_API_KEY") or "").strip() or None
         if api_key:
             kwargs["api_key"] = api_key
         timeout_s = ctx.timeout_s if ctx.timeout_s and ctx.timeout_s > 0 else DEFAULT_TIMEOUT_S
@@ -210,8 +240,36 @@ class DirectHarness:
             )
             if captured is not None:
                 return captured
+            status, _ = _http_error_details(exc)
+            if status in {401, 403}:
+                log.warning(
+                    "direct_auth_rejected",
+                    status=status,
+                    api_key_env=model.api_key_env,
+                    credential_before_import=credential_before_import,
+                    credential_after_import=credential_after_import,
+                    api_key=_secret_fingerprint(api_key),
+                    request_headers={
+                        name: _secret_fingerprint(value) for name, value in env_headers.items()
+                    },
+                )
+            auth_diagnostic = ""
+            if status == 401:
+                auth_diagnostic = (
+                    " [credential diagnostics: "
+                    f"env={model.api_key_env or 'unset'}, "
+                    f"before={credential_before_import}, "
+                    f"after={credential_after_import}, "
+                    f"request={_secret_fingerprint(api_key)}, "
+                    "headers="
+                    + ",".join(
+                        f"{name}:{_secret_fingerprint(value)}"
+                        for name, value in sorted(env_headers.items())
+                    )
+                    + "]"
+                )
             raise HarnessError(
-                f"{type(exc).__name__}: {exc}",
+                f"{type(exc).__name__}: {exc}{auth_diagnostic}",
                 retryable=is_retryable(exc),
                 kind="provider_error",
             ) from exc
@@ -237,10 +295,15 @@ class DirectHarness:
             policy = _capture_policy(ctx.harness_config)
             if policy is None or code not in policy[1]:
                 raise HarnessError(
-                    f"stream ended with an uncaptured error: {stream_error}",
+                    f"stream ended with an uncaptured error: {redact_for_display(stream_error)}",
                     retryable=_retryable_stream_error(stream_error),
                     kind="provider_error",
                 )
+            # A captured refusal before the first SSE chunk never reached the
+            # billable upstream generation. Mid-stream failures retain unknown
+            # cost because some provider work has already happened.
+            if stream_info is not None and stream_info.get("chunks") == 0:
+                usage.cost_usd = 0.0
             adapted = _output_adapter(ctx.harness_config) == GUARDRAIL_VERDICT_V1
             output = (
                 guardrail_verdict_v1(
@@ -385,6 +448,49 @@ async def _read_openai_stream(
         if response.is_error:
             await response.aread()
             response.raise_for_status()
+        media_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        if media_type != "text/event-stream":
+            await response.aread()
+            try:
+                body = response.json()
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                excerpt = str(redact_for_display(response.text))[:500]
+                raise HarnessError(
+                    "streaming endpoint returned a non-SSE, non-JSON 200 response "
+                    f"(content-type={media_type or 'missing'}): {excerpt}",
+                    retryable=False,
+                    kind="provider_error",
+                ) from exc
+            if not isinstance(body, dict):
+                raise HarnessError(
+                    "streaming endpoint returned a non-object JSON response "
+                    f"(content-type={media_type or 'missing'})",
+                    retryable=False,
+                    kind="provider_error",
+                )
+            normalized = {str(key): value for key, value in body.items()}
+            raw_error = normalized.get("error")
+            if raw_error is not None:
+                normalized["_gaugix_stream"] = {
+                    "chunks": 0,
+                    "first_delta_ms": None,
+                    "interrupted": True,
+                }
+                normalized["_gaugix_stream_error"] = (
+                    {
+                        key: value
+                        for key, value in normalized.items()
+                        if not key.startswith("_gaugix_")
+                    }
+                    if isinstance(raw_error, Mapping)
+                    else {
+                        "error": {
+                            "code": "stream_error",
+                            "message": str(raw_error),
+                        }
+                    }
+                )
+            return normalized
         async for line in response.aiter_lines():
             line = line.strip()
             if not line.startswith("data:"):
@@ -524,7 +630,9 @@ def capture_http_error(
     return InvocationResult(
         output_text=output_text,
         messages=[*messages, {"role": "assistant", "content": output_text}],
-        usage=Usage(latency_ms=latency_ms),
+        # The Gateway rejected the request before upstream generation, so the
+        # model-token cost for this captured outcome is exactly zero.
+        usage=Usage(latency_ms=latency_ms, cost_usd=0.0),
         raw={
             "model": model_string,
             "provider": provider,
@@ -632,7 +740,7 @@ def case_request_overrides(
     test payloads reproducible, while a forced function schema exercises the
     real MCP boundary without replacing the business LLM with a stub.
     """
-    if not _case_request_overrides_enabled(config) or not messages:
+    if not messages:
         return messages, {}
     first = messages[0]
     if first.get("role") != "system":
@@ -640,6 +748,12 @@ def case_request_overrides(
     match = _CASE_DIRECTIVE.fullmatch(first.get("content") or "")
     if not match:
         return messages, {}
+    if not _case_request_overrides_enabled(config):
+        raise HarnessError(
+            "@gaugix case request directive requires allow_case_request_overrides=true",
+            retryable=False,
+            kind="config",
+        )
     if len(match.group(1).encode("utf-8")) > MAX_CASE_OVERRIDE_BYTES:
         raise HarnessError(
             f"@gaugix case request directive exceeds {MAX_CASE_OVERRIDE_BYTES} bytes",
@@ -648,7 +762,7 @@ def case_request_overrides(
         )
     try:
         raw = json.loads(match.group(1))
-    except json.JSONDecodeError as exc:
+    except (json.JSONDecodeError, RecursionError) as exc:
         raise HarnessError(
             f"invalid @gaugix case request directive: {exc}",
             retryable=False,
@@ -847,11 +961,14 @@ def _case_request_overrides_enabled(config: Mapping[str, Any]) -> bool:
     return value
 
 
-def headers_from_env(config: Mapping[str, Any]) -> dict[str, str]:
+def headers_from_env(
+    config: Mapping[str, Any], *, environment: Mapping[str, str] | None = None
+) -> dict[str, str]:
     """Resolve configured request headers while keeping their values out of profiles."""
+    source = os.environ if environment is None else environment
     headers: dict[str, str] = {}
     for header, env_name in _header_env_names(config).items():
-        value = os.environ.get(env_name, "").strip()
+        value = source.get(env_name, "").strip()
         if not value:
             raise HarnessError(
                 f"direct harness request header {header!r} needs environment variable {env_name}",

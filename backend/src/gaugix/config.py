@@ -2,8 +2,9 @@
 
 Everything the app needs to boot lives here. Provider API keys are deliberately
 *not* modelled as settings fields: per ARCHITECTURE §11 they are read from the
-process environment at call time and are only ever surfaced as present/absent
-plus a masked suffix (see :func:`provider_key_status`).
+process environment and are only ever surfaced as present/absent plus a masked
+suffix (see :func:`provider_key_status`). Production deployments may opt into an
+immutable startup snapshot with ``GAUGIX_FREEZE_CREDENTIALS=1``.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 from collections.abc import Mapping
 from functools import lru_cache
 from pathlib import Path
@@ -31,6 +33,13 @@ PROVIDER_KEY_ENV: dict[str, str] = {
     "openrouter": "OPENROUTER_API_KEY",
 }
 
+# Opt-in production hardening. The snapshot is lazy because create_app()/CLI
+# load the repo dotenv after importing this module; taking it at import time
+# would silently omit dotenv-only credentials. A lock keeps simultaneous first
+# requests on one consistent snapshot.
+_FROZEN_CREDENTIAL_ENV: Mapping[str, str] | None = None
+_CREDENTIAL_ENV_LOCK = threading.Lock()
+
 
 class Settings(BaseSettings):
     """Runtime configuration, sourced from the environment and repo-root `.env`."""
@@ -44,6 +53,7 @@ class Settings(BaseSettings):
 
     host: str = Field(default="127.0.0.1", validation_alias="GAUGIX_HOST")
     port: int = Field(default=8317, validation_alias="GAUGIX_PORT")
+    instance_id: str | None = Field(default=None, validation_alias="GAUGIX_INSTANCE_ID")
     data_dir: Path = Field(default=Path("./data"), validation_alias="GAUGIX_DATA_DIR")
     db_path: Path | None = Field(default=None, validation_alias="GAUGIX_DB_PATH")
     provider_concurrency: int = Field(default=4, validation_alias="GAUGIX_PROVIDER_CONCURRENCY")
@@ -129,7 +139,10 @@ def get_settings() -> Settings:
 
 def reset_settings_cache() -> None:
     """Drop the cached settings — used by tests that manipulate the environment."""
+    global _FROZEN_CREDENTIAL_ENV
     get_settings.cache_clear()
+    with _CREDENTIAL_ENV_LOCK:
+        _FROZEN_CREDENTIAL_ENV = None
 
 
 def mask_key(value: str) -> str:
@@ -467,9 +480,10 @@ def provider_key_status() -> dict[str, dict[str, object]]:
 
     Never returns key material. Consumed by `GET /api/v1/settings/providers`.
     """
+    environment = credential_environment()
     status: dict[str, dict[str, object]] = {}
     for provider, env_name in PROVIDER_KEY_ENV.items():
-        raw = os.environ.get(env_name, "").strip()
+        raw = environment.get(env_name, "").strip()
         status[provider] = {
             "env_var": env_name,
             "present": bool(raw),
@@ -479,8 +493,19 @@ def provider_key_status() -> dict[str, dict[str, object]]:
 
 
 def read_api_key(env_var: str | None) -> str | None:
-    """Read a credential from the environment by variable name, at call time."""
+    """Read a credential from the active (optionally frozen) environment."""
     if not env_var:
         return None
-    value = os.environ.get(env_var, "").strip()
+    value = credential_environment().get(env_var, "").strip()
     return value or None
+
+
+def credential_environment() -> Mapping[str, str]:
+    """Return the immutable startup environment when production freezing is enabled."""
+    global _FROZEN_CREDENTIAL_ENV
+    if os.environ.get("GAUGIX_FREEZE_CREDENTIALS") != "1":
+        return os.environ
+    with _CREDENTIAL_ENV_LOCK:
+        if _FROZEN_CREDENTIAL_ENV is None:
+            _FROZEN_CREDENTIAL_ENV = dict(os.environ)
+        return _FROZEN_CREDENTIAL_ENV

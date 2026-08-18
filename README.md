@@ -140,6 +140,14 @@ API or report renders them. This distinction is important
 for Guardrails: a structured block can be the expected outcome while still failing an
 optional source-attribution diagnostic if another rule blocked first.
 
+### Rerun compatibility note
+
+Runs created by older Gaugix versions did not record whether code-execution scoring
+was explicitly accepted. If such a run now contains a Python scorer, a bare
+`POST /api/v1/runs/{run_id}/rerun` is rejected and must be retried with
+`{"accept_code_execution": true}` as the JSON body. This deliberately asks for
+fresh consent instead of inferring it from historical data.
+
 For a single-process production-style build:
 
 ```bash

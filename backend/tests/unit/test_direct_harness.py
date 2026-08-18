@@ -11,6 +11,7 @@ import json
 import httpx
 import pytest
 
+from gaugix.config import reset_settings_cache
 from gaugix.domain import (
     CaseSnapshot,
     HarnessError,
@@ -21,7 +22,11 @@ from gaugix.domain import (
     Provider,
     Role,
 )
-from gaugix.harness.direct import DirectHarness, validate_direct_harness_config
+from gaugix.harness.direct import (
+    DirectHarness,
+    case_request_overrides,
+    validate_direct_harness_config,
+)
 
 
 class ProviderHTTPError(Exception):
@@ -88,6 +93,28 @@ async def test_captures_only_an_explicit_structured_policy_refusal(monkeypatch):
         "body": body,
     }
     assert result.usage.latency_ms >= 0
+    assert result.usage.cost_usd == 0.0
+
+
+def test_deep_case_directive_is_a_single_config_error_not_a_process_error():
+    nested = "[" * 1100 + "]" * 1100
+    messages = [{"role": "system", "content": f'@gaugix {{"tools": {nested}}}'}]
+
+    with pytest.raises(HarnessError) as exc:
+        case_request_overrides(messages, {"allow_case_request_overrides": True})
+
+    assert exc.value.kind == "config"
+    assert exc.value.retryable is False
+
+
+async def test_capture_http_errors_rejects_non_openai_compatible_profiles():
+    model = MODEL.model_copy(update={"provider": Provider.openai})
+
+    with pytest.raises(HarnessError) as exc:
+        await DirectHarness().invoke(CASE, model, InvokeContext(harness_config=CAPTURE))
+
+    assert exc.value.kind == "config"
+    assert "openai_compatible" in str(exc.value)
 
 
 async def test_guardrail_adapter_normalizes_a_captured_refusal(monkeypatch):
@@ -316,6 +343,24 @@ async def test_stream_directive_rejects_non_openai_compatible_profiles():
 
     assert exc.value.kind == "config"
     assert "OpenAI-compatible" in str(exc.value)
+
+
+async def test_case_request_directive_requires_the_explicit_profile_opt_in():
+    case = CASE.model_copy(
+        update={
+            "input": [
+                Message(role=Role.system, content='@gaugix {"stream": true}'),
+                Message(role=Role.user, content="hello"),
+            ]
+        }
+    )
+
+    with pytest.raises(HarnessError) as exc:
+        await DirectHarness().invoke(case, MODEL, InvokeContext(harness_config={}))
+
+    assert exc.value.kind == "config"
+    assert exc.value.retryable is False
+    assert "allow_case_request_overrides=true" in str(exc.value)
 
 
 async def test_case_request_directive_supports_strict_output_and_declared_tools(
@@ -602,6 +647,166 @@ async def test_real_http_path_collects_streamed_text_and_metadata(monkeypatch):
     assert seen["cost_model"] == "openrouter/qwen/qwen3.6-27b"
 
 
+async def test_stream_request_accepts_a_non_streaming_json_completion(monkeypatch):
+    calls = 0
+
+    def handler(_request):
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            200,
+            json={
+                "model": "qwen/qwen3.6-27b",
+                "choices": [{"message": {"content": "ordinary JSON response"}}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 3},
+            },
+        )
+
+    use_transport(monkeypatch, handler)
+    case = CASE.model_copy(
+        update={
+            "input": [
+                Message(role=Role.system, content='@gaugix {"stream": true}'),
+                Message(role=Role.user, content="hello"),
+            ]
+        }
+    )
+
+    result = await DirectHarness().invoke(
+        case,
+        MODEL,
+        InvokeContext(harness_config={**ADAPTED, "allow_case_request_overrides": True}),
+    )
+    output = json.loads(result.output_text)
+
+    assert calls == 1
+    assert output["verdict"] == "allowed"
+    assert output["completion"] == "ordinary JSON response"
+    assert output["stream"] is None
+    assert result.usage.prompt_tokens == 3
+    assert result.usage.completion_tokens == 3
+
+
+async def test_stream_request_preserves_a_json_guardrail_error(monkeypatch):
+    def handler(_request):
+        return httpx.Response(
+            200,
+            json={
+                "error": {
+                    "code": "guardrails_blocked",
+                    "message": "blocked before SSE",
+                    "param": {"rule_id": "kw-deny", "method": "keyword"},
+                }
+            },
+        )
+
+    use_transport(monkeypatch, handler)
+    case = CASE.model_copy(
+        update={
+            "input": [
+                Message(role=Role.system, content='@gaugix {"stream": true}'),
+                Message(role=Role.user, content="hello"),
+            ]
+        }
+    )
+
+    result = await DirectHarness().invoke(
+        case,
+        MODEL,
+        InvokeContext(harness_config={**ADAPTED, "allow_case_request_overrides": True}),
+    )
+    output = json.loads(result.output_text)
+
+    assert output["verdict"] == "blocked"
+    assert output["rule_id"] == "kw-deny"
+    assert result.raw["captured_stream_error"]["error"]["code"] == "guardrails_blocked"
+    assert result.usage.cost_usd == 0.0
+
+
+async def test_stream_request_classifies_a_json_string_error_as_retryable(monkeypatch):
+    def handler(_request):
+        return httpx.Response(200, json={"error": "rate limited, please retry"})
+
+    use_transport(monkeypatch, handler)
+    case = CASE.model_copy(
+        update={
+            "input": [
+                Message(role=Role.system, content='@gaugix {"stream": true}'),
+                Message(role=Role.user, content="hello"),
+            ]
+        }
+    )
+
+    with pytest.raises(HarnessError) as exc:
+        await DirectHarness().invoke(
+            case,
+            MODEL,
+            InvokeContext(harness_config={**ADAPTED, "allow_case_request_overrides": True}),
+        )
+
+    assert exc.value.kind == "provider_error"
+    assert exc.value.retryable is True
+    assert "rate limited, please retry" in str(exc.value)
+
+
+async def test_stream_request_rejects_a_non_json_200_without_retry(monkeypatch):
+    leaked = "sk-or-v1-" + ("a" * 32)
+    proxy_page = "<html>upstream proxy page</html>" + ("x" * 459) + " " + leaked
+
+    def handler(_request):
+        return httpx.Response(
+            200,
+            text=proxy_page,
+            headers={"content-type": "text/html; charset=utf-8"},
+        )
+
+    use_transport(monkeypatch, handler)
+    case = CASE.model_copy(
+        update={
+            "input": [
+                Message(role=Role.system, content='@gaugix {"stream": true}'),
+                Message(role=Role.user, content="hello"),
+            ]
+        }
+    )
+
+    with pytest.raises(HarnessError) as exc:
+        await DirectHarness().invoke(
+            case,
+            MODEL,
+            InvokeContext(harness_config={**ADAPTED, "allow_case_request_overrides": True}),
+        )
+
+    assert exc.value.kind == "provider_error"
+    assert exc.value.retryable is False
+    assert "content-type=text/html" in str(exc.value)
+    assert "upstream proxy page" in str(exc.value)
+    assert leaked not in str(exc.value)
+    assert "sk-or-v1" not in str(exc.value)
+
+
+async def test_openai_compatible_fallback_ignores_a_whitespace_key(monkeypatch):
+    seen = {}
+
+    def handler(request):
+        seen["authorization"] = request.headers.get("authorization")
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": "safe"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            },
+        )
+
+    use_transport(monkeypatch, handler)
+    monkeypatch.setenv("OPENAI_API_KEY", "   ")
+    model = MODEL.model_copy(update={"api_key_env": None})
+
+    await DirectHarness().invoke(model=model, case=CASE, ctx=InvokeContext(harness_config=CAPTURE))
+
+    assert seen["authorization"] is None
+
+
 async def test_stream_tool_fragments_without_indices_continue_the_current_call(monkeypatch):
     def handler(_request):
         return httpx.Response(
@@ -747,6 +952,7 @@ async def test_real_http_path_scores_a_midstream_guardrail_refusal(monkeypatch):
     assert output["completion"] == "prefix"
     assert output["stream"]["interrupted"] is True
     assert result.raw["captured_stream_error"]["error"]["code"] == "guardrails_blocked"
+    assert result.usage.cost_usd is None
 
 
 async def test_real_http_path_scores_a_pre_stream_http_guardrail_refusal(monkeypatch):
@@ -997,6 +1203,67 @@ async def test_request_headers_are_resolved_from_environment_without_entering_ra
 
     assert seen["extra_headers"] == {"x-mt-vk": "local-secret"}
     assert "local-secret" not in json.dumps(result.raw)
+
+
+async def test_direct_harness_freezes_credentials_only_when_opted_in(monkeypatch):
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": "ok"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            },
+        )
+
+    monkeypatch.setenv("GAUGIX_FREEZE_CREDENTIALS", "1")
+    monkeypatch.setenv("MT0_EVAL_VK", "deployment-key")
+    reset_settings_cache()
+    try:
+        harness = DirectHarness()
+        use_transport(monkeypatch, handler)
+        model = MODEL.model_copy(update={"api_key_env": "MT0_EVAL_VK"})
+        config = {**CAPTURE, "request_headers_from_env": {"x-mt-vk": "MT0_EVAL_VK"}}
+
+        await harness.invoke(CASE, model, InvokeContext(harness_config=config))
+        monkeypatch.setenv("MT0_EVAL_VK", "unrelated-local-stack-key")
+        await harness.invoke(CASE, model, InvokeContext(harness_config=config))
+
+        assert len(seen) == 2
+        assert all(r.headers["authorization"] == "Bearer deployment-key" for r in seen)
+        assert all(r.headers["x-mt-vk"] == "deployment-key" for r in seen)
+    finally:
+        reset_settings_cache()
+
+
+async def test_direct_harness_uses_rotated_credentials_when_freezing_is_off(monkeypatch):
+    seen = {}
+
+    def handler(request):
+        seen["request"] = request
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": "ok"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            },
+        )
+
+    monkeypatch.delenv("GAUGIX_FREEZE_CREDENTIALS", raising=False)
+    monkeypatch.setenv("MT0_EVAL_VK", "old-key")
+    reset_settings_cache()
+    harness = DirectHarness()
+    monkeypatch.setenv("MT0_EVAL_VK", "rotated-key")
+    use_transport(monkeypatch, handler)
+    model = MODEL.model_copy(update={"api_key_env": "MT0_EVAL_VK"})
+    config = {**CAPTURE, "request_headers_from_env": {"x-mt-vk": "MT0_EVAL_VK"}}
+
+    await harness.invoke(CASE, model, InvokeContext(harness_config=config))
+
+    assert seen["request"].headers["authorization"] == "Bearer rotated-key"
+    assert seen["request"].headers["x-mt-vk"] == "rotated-key"
 
 
 def test_request_header_config_rejects_literal_values_and_invalid_names():
