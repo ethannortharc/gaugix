@@ -14,6 +14,7 @@ touched the result — because a report you cannot audit is marketing.
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -31,7 +32,9 @@ from gaugix.compare import (
     mean_score,
     pass_rate,
 )
+from gaugix.config import redact_for_display
 from gaugix.models.runs import Attempt, Run, RunItem
+from gaugix.models.scores import Score
 from gaugix.report import svg
 
 TEMPLATE_DIR = Path(__file__).parent / "templates"
@@ -47,6 +50,7 @@ def _environment() -> Environment:
     env.filters["money"] = _money
     env.filters["pct"] = _pct
     env.filters["num"] = _num
+    env.filters["pretty"] = _pretty
     return env
 
 
@@ -64,6 +68,10 @@ def _pct(value: float | None) -> str:
 
 def _num(value: float | None) -> str:
     return "—" if value is None else f"{value:,.0f}"
+
+
+def _pretty(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, indent=2, default=str)
 
 
 def _stamp() -> str:
@@ -103,14 +111,14 @@ def _run_context(session: Session, run: Run) -> dict[str, Any]:
     if run.started_at and run.finished_at:
         duration = (run.finished_at - run.started_at).total_seconds()
 
-    failures = [f for f in facts if f.verdict is False or f.status == "error"]
+    failed_facts = [f for f in facts if f.verdict is False or f.status == "error"]
     return {
         "run": run,
         "facts": facts,
         "leaderboard": board,
         "totals": board["totals"],
         "duration_s": duration,
-        "failures": sorted(failures, key=lambda f: (f.set_name, f.position))[:200],
+        "failures": _failure_details(session, failed_facts, [run]),
         "charts": {
             "pass_rate": svg.bar_chart(
                 [(row["executor_key"], row["pass_rate"]) for row in board["rows"]],
@@ -123,6 +131,109 @@ def _run_context(session: Session, run: Run) -> dict[str, Any]:
             ),
         },
     }
+
+
+def _failure_details(
+    session: Session,
+    facts: list[ItemFacts],
+    runs: list[Run],
+) -> list[dict[str, Any]]:
+    """Make exported failures independently explainable and reproducible."""
+    ordered = sorted(
+        facts,
+        key=lambda fact: (fact.set_name, fact.executor_key, fact.position),
+    )[:200]
+    item_ids = [fact.item_id for fact in ordered]
+    if not item_ids:
+        return []
+    items = {
+        item.id: item
+        for item in session.exec(select(RunItem).where(col(RunItem.id).in_(item_ids))).all()
+        if item.id is not None
+    }
+    attempts: dict[int, Attempt] = {}
+    for attempt_row in session.exec(
+        select(Attempt)
+        .where(
+            col(Attempt.run_item_id).in_(item_ids),
+            col(Attempt.superseded).is_(False),
+        )
+        .order_by(col(Attempt.run_item_id), col(Attempt.n))
+    ).all():
+        attempts[attempt_row.run_item_id] = attempt_row
+    latest_scores: dict[tuple[int, int], Score] = {}
+    for score in session.exec(
+        select(Score)
+        .where(col(Score.run_item_id).in_(item_ids))
+        .order_by(col(Score.run_item_id), col(Score.scorer_index), col(Score.version))
+    ).all():
+        latest_scores[(score.run_item_id, score.scorer_index)] = score
+    executors = {
+        (run.id or 0, snapshot.key): redact_for_display(snapshot.model_dump(mode="json"))
+        for run in runs
+        for snapshot in run.executors
+    }
+
+    details: list[dict[str, Any]] = []
+    for fact in ordered:
+        item = items.get(fact.item_id)
+        if item is None:
+            continue
+        snapshot = item.case_snapshot
+        attempt = attempts.get(fact.item_id)
+        scores = [
+            score
+            for (score_item_id, _index), score in latest_scores.items()
+            if score_item_id == fact.item_id
+        ]
+        scores.sort(key=lambda score: score.scorer_index)
+        score_details = []
+        for score in scores:
+            spec = (
+                snapshot.scoring[score.scorer_index]
+                if score.scorer_index < len(snapshot.scoring)
+                else None
+            )
+            score_details.append(
+                {
+                    "type": score.scorer_type,
+                    "required": spec.required if spec is not None else None,
+                    "passed": score.passed,
+                    "rationale": redact_for_display(score.rationale),
+                }
+            )
+        details.append(
+            {
+                "run_id": fact.run_id,
+                "status": fact.status,
+                "title": fact.title,
+                "set_name": fact.set_name,
+                "executor_key": fact.executor_key,
+                "error": redact_for_display(fact.error),
+                "input": redact_for_display(
+                    [message.model_dump(mode="json") for message in snapshot.input]
+                ),
+                "reference": redact_for_display(snapshot.reference),
+                "actual": (redact_for_display(attempt.output_text) if attempt is not None else ""),
+                "attempt_error": (
+                    redact_for_display(attempt.error) if attempt is not None else None
+                ),
+                "score_details": score_details,
+                "scoring": redact_for_display(
+                    [spec.model_dump(mode="json") for spec in snapshot.scoring]
+                ),
+                "case_tags": snapshot.tags,
+                "case_notes": redact_for_display(snapshot.notes),
+                "executor": executors.get((fact.run_id, fact.executor_key)),
+                "provider_messages": (
+                    redact_for_display(attempt.messages or []) if attempt is not None else []
+                ),
+                "invocation_metadata": (
+                    redact_for_display(attempt.request or {}) if attempt is not None else {}
+                ),
+            }
+        )
+    return details
 
 
 def _datasets(run: Run) -> list[dict[str, Any]]:
@@ -246,10 +357,11 @@ def build_comparison_report(
             attempt_count=_attempt_count(session, run_ids),
             pass_rate_overall=pass_rate(facts),
             mean_score_overall=mean_score(facts),
-            failures=sorted(
+            failures=_failure_details(
+                session,
                 [f for f in facts if f.verdict is False or f.status == "error"],
-                key=lambda f: (f.set_name, f.executor_key, f.position),
-            )[:200],
+                runs,
+            ),
             charts={
                 "pass_rate": svg.bar_chart(
                     [(row["executor_key"], row["pass_rate"]) for row in board["rows"]],

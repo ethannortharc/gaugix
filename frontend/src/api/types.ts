@@ -274,7 +274,14 @@ export interface RunTotals {
 export interface ExecutorSnapshot {
   executor_id: number | null
   key: string
-  model: { name: string; provider: Provider; model_id: string; params: Record<string, unknown> }
+  model: {
+    name: string
+    provider: Provider
+    model_id: string
+    base_url?: string | null
+    api_key_env?: string | null
+    params: Record<string, unknown>
+  }
   harness: { name: string; kind: HarnessKind; config: Record<string, unknown> }
   overrides: Record<string, unknown>
 }
@@ -412,6 +419,8 @@ export interface RunItem {
   score_value: number | null
   needs_human: boolean
   error: string | null
+  /** Latest scorer explanation, so a failed row says why before drill-down. */
+  score_summary: string | null
   updated_at: string
 }
 
@@ -419,6 +428,7 @@ export interface AttemptRead {
   id: number
   n: number
   status: 'ok' | 'error'
+  request: Record<string, unknown>
   output_text: string
   messages: { role: string; content: string }[]
   prompt_tokens: number
@@ -450,6 +460,7 @@ export interface RunItemDetail extends RunItem, RunItemNav {
   input: Message[]
   reference: string | null
   case_snapshot: CaseIO & { case_id: number | null }
+  executor_snapshot: ExecutorSnapshot | null
   attempts: AttemptRead[]
   scores: ScoreRead[]
   artifacts: Record<string, unknown>[]

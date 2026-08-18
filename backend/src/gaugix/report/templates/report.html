@@ -89,6 +89,13 @@ footer { margin-top: 40px; padding-top: 18px; border-top: 1px solid var(--line);
 footer dt { font-weight: 600; color: var(--ink); margin-top: 10px; font-size: 12px; }
 footer dd { margin: 2px 0 0; }
 .rule-note { font-size: 12.5px; color: var(--muted); margin-top: 6px; }
+.failure-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:10px; }
+.failure-grid h4 { margin:0 0 4px; font-size:11px; color:var(--muted);
+  text-transform:uppercase; letter-spacing:.06em; }
+.failure-grid pre { margin:0; height:100%; }
+.failure-wide { grid-column:1 / -1; }
+@media (max-width: 700px) { .failure-grid { grid-template-columns:1fr; }
+  .failure-wide { grid-column:auto; } }
 @media print {
   body { background: var(--paper); padding: 0; }
   .card, .tile { break-inside: avoid; }
@@ -289,7 +296,34 @@ footer dd { margin: 2px 0 0; }
       {{ item.title }}
       <span class="mono" style="color:var(--muted)">· {{ item.executor_key }}</span>
     </summary>
-    <pre>{{ item.error or 'Scored as failing. Open the item in Gaugix for the per-scorer rationale.' }}</pre>
+    <div class="failure-grid">
+      <div>
+        <h4>Input</h4>
+        <pre>{{ item.input | pretty }}</pre>
+      </div>
+      <div>
+        <h4>Expected result</h4>
+        <pre>{{ item.reference or item.scoring | pretty }}</pre>
+      </div>
+      <div>
+        <h4>Actual result</h4>
+        <pre>{{ item.actual or item.attempt_error or 'No model output was captured.' }}</pre>
+      </div>
+      <div>
+        <h4>Why it failed</h4>
+        <pre>{% if item.error %}{{ item.error }}
+{% endif %}{% for score in item.score_details if score.passed is not sameas true %}[{{ 'required' if score.required else 'diagnostic' }}] {{ score.type }}: {{ score.rationale or 'No rationale recorded.' }}
+{% else %}No failing scorer rationale was recorded.{% endfor %}</pre>
+      </div>
+      <details class="failure-wide">
+        <summary>Frozen case and scoring configuration</summary>
+        <pre>{{ {'tags': item.case_tags, 'notes': item.case_notes, 'scoring': item.scoring} | pretty }}</pre>
+      </details>
+      <details class="failure-wide">
+        <summary>Frozen executor and captured invocation evidence</summary>
+        <pre>{{ {'executor': item.executor, 'provider_messages': item.provider_messages, 'invocation_metadata': item.invocation_metadata} | pretty }}</pre>
+      </details>
+    </div>
   </details>
   {% endfor %}
   {% if failures | length >= 200 %}

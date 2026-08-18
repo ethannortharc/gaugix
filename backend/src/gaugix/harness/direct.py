@@ -16,7 +16,7 @@ import os
 import re
 import time
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, cast
 
 import httpx
 
@@ -52,8 +52,11 @@ RETRYABLE_MARKERS = (
 
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _HEADER_NAME = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+_FUNCTION_NAME = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_CASE_DIRECTIVE = re.compile(r"^\s*@gaugix\s+(\{.*\})\s*$", re.DOTALL)
 GUARDRAIL_VERDICT_V1 = "guardrail_verdict_v1"
 DEFAULT_TIMEOUT_S = 600.0
+MAX_CASE_OVERRIDE_BYTES = 32_768
 
 
 def litellm_model_string(model: ModelSnapshot) -> str:
@@ -138,8 +141,20 @@ class DirectHarness:
         import litellm
 
         model_string = litellm_model_string(model)
-        messages = case.messages_for_api()
-        params: dict[str, Any] = {**model.params, **(ctx.params or {})}
+        messages, case_params = case_request_overrides(case.messages_for_api(), ctx.harness_config)
+        params: dict[str, Any] = {
+            **model.params,
+            **(ctx.params or {}),
+            **case_params,
+        }
+        provider = Provider(model.provider)
+        stream_requested = params.get("stream") is True
+        if stream_requested and provider is not Provider.openai_compatible:
+            raise HarnessError(
+                "streaming (stream=true) currently requires an OpenAI-compatible model profile",
+                retryable=False,
+                kind="config",
+            )
         env_headers = headers_from_env(ctx.harness_config)
 
         kwargs: dict[str, Any] = {"model": model_string, "messages": messages, **params}
@@ -168,9 +183,8 @@ class DirectHarness:
 
         started = time.perf_counter()
         try:
-            if (
-                _capture_policy(ctx.harness_config) is not None
-                and Provider(model.provider) is Provider.openai_compatible
+            if provider is Provider.openai_compatible and (
+                _capture_policy(ctx.harness_config) is not None or stream_requested
             ):
                 response = await _openai_compatible_completion(
                     model=model,
@@ -203,12 +217,63 @@ class DirectHarness:
             ) from exc
         latency_ms = int((time.perf_counter() - started) * 1000)
 
+        stream_info = _stream_info(response)
+        stream_error = _stream_error(response)
         output_text, usage = _extract(response, latency_ms)
-        usage.cost_usd = resolve_cost(response, model, usage, self.pricing_table)
+        stream_usage_missing = (
+            stream_info is not None
+            and isinstance(response, Mapping)
+            and (not isinstance(response.get("usage"), Mapping) or not response.get("usage"))
+        )
+        usage.cost_usd = (
+            None
+            if stream_usage_missing
+            else resolve_cost(response, model, usage, self.pricing_table)
+        )
         source_output = output_text
+        tool_calls = _extract_tool_calls(response)
+        if stream_error is not None:
+            code = _error_code(stream_error)
+            policy = _capture_policy(ctx.harness_config)
+            if policy is None or code not in policy[1]:
+                raise HarnessError(
+                    f"stream ended with an uncaptured error: {stream_error}",
+                    retryable=_retryable_stream_error(stream_error),
+                    kind="provider_error",
+                )
+            adapted = _output_adapter(ctx.harness_config) == GUARDRAIL_VERDICT_V1
+            output = (
+                guardrail_verdict_v1(
+                    completion=source_output,
+                    error_body=stream_error,
+                    http_status=200,
+                    stream=stream_info,
+                    tool_calls=tool_calls,
+                )
+                if adapted
+                else stream_error
+            )
+            output_text = json.dumps(output, ensure_ascii=False, sort_keys=True)
+            return InvocationResult(
+                output_text=output_text,
+                messages=[*messages, {"role": "assistant", "content": source_output}],
+                usage=usage,
+                raw={
+                    "model": model_string,
+                    "provider": str(model.provider),
+                    "captured_stream_error": stream_error,
+                    "source_output_text": source_output,
+                    "stream": stream_info,
+                    **({"tool_calls": tool_calls} if tool_calls else {}),
+                },
+            )
         if _output_adapter(ctx.harness_config) == GUARDRAIL_VERDICT_V1:
             output_text = json.dumps(
-                guardrail_verdict_v1(completion=source_output),
+                guardrail_verdict_v1(
+                    completion=source_output,
+                    stream=stream_info,
+                    tool_calls=tool_calls,
+                ),
                 ensure_ascii=False,
                 sort_keys=True,
             )
@@ -225,6 +290,8 @@ class DirectHarness:
                     if _output_adapter(ctx.harness_config) == GUARDRAIL_VERDICT_V1
                     else {}
                 ),
+                **({"stream": stream_info} if stream_info is not None else {}),
+                **({"tool_calls": tool_calls} if tool_calls else {}),
             },
         )
 
@@ -249,7 +316,7 @@ async def _openai_compatible_completion(
     """
     if not model.base_url:
         raise HarnessError(
-            "capturing structured HTTP errors requires an OpenAI-compatible base_url",
+            "direct OpenAI-compatible streaming/error capture requires a base_url",
             retryable=False,
             kind="config",
         )
@@ -258,6 +325,8 @@ async def _openai_compatible_completion(
         "messages": messages,
         **params,
     }
+    if payload.get("stream") is True:
+        payload.setdefault("stream_options", {"include_usage": True})
     configured_headers = payload.pop("extra_headers", {}) or {}
     if not isinstance(configured_headers, Mapping):
         raise HarnessError(
@@ -271,13 +340,21 @@ async def _openai_compatible_completion(
     headers.update(_merge_headers(configured_headers, env_headers))
     timeout = timeout_s if timeout_s and timeout_s > 0 else DEFAULT_TIMEOUT_S
     async with httpx.AsyncClient(timeout=timeout) as client:
-        response = await client.post(
-            model.base_url.rstrip("/") + "/chat/completions",
-            headers=headers,
-            json=payload,
-        )
-        response.raise_for_status()
-        body = response.json()
+        if payload.get("stream") is True:
+            body = await _read_openai_stream(
+                client,
+                model.base_url.rstrip("/") + "/chat/completions",
+                headers,
+                payload,
+            )
+        else:
+            response = await client.post(
+                model.base_url.rstrip("/") + "/chat/completions",
+                headers=headers,
+                json=payload,
+            )
+            response.raise_for_status()
+            body = response.json()
     if not isinstance(body, dict):
         raise HarnessError(
             "OpenAI-compatible endpoint returned a non-object JSON response",
@@ -285,6 +362,124 @@ async def _openai_compatible_completion(
             kind="provider_error",
         )
     return {str(key): value for key, value in body.items()}
+
+
+async def _read_openai_stream(
+    client: httpx.AsyncClient,
+    url: str,
+    headers: Mapping[str, str],
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Collect exactly what an OpenAI-compatible SSE client receives."""
+    started = time.perf_counter()
+    parts: list[str] = []
+    chunks = 0
+    first_delta_ms: int | None = None
+    interrupted = False
+    error: dict[str, Any] | None = None
+    saw_done = False
+    usage: dict[str, Any] = {}
+    tool_calls: dict[int, dict[str, Any]] = {}
+
+    async with client.stream("POST", url, headers=headers, json=dict(payload)) as response:
+        if response.is_error:
+            await response.aread()
+            response.raise_for_status()
+        async for line in response.aiter_lines():
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                saw_done = True
+                break
+            try:
+                event = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event, Mapping):
+                continue
+            if isinstance(event.get("usage"), Mapping):
+                usage = {str(key): value for key, value in event["usage"].items()}
+            raw_error = event.get("error")
+            if raw_error is not None:
+                error = (
+                    {str(key): value for key, value in event.items()}
+                    if isinstance(raw_error, Mapping)
+                    else {
+                        "error": {
+                            "code": "stream_error",
+                            "message": str(raw_error),
+                        }
+                    }
+                )
+                interrupted = True
+                break
+            for choice in event.get("choices") or []:
+                if not isinstance(choice, Mapping):
+                    continue
+                delta = choice.get("delta")
+                if not isinstance(delta, Mapping):
+                    continue
+                piece = delta.get("content")
+                if isinstance(piece, str) and piece:
+                    if first_delta_ms is None:
+                        first_delta_ms = int((time.perf_counter() - started) * 1000)
+                    parts.append(piece)
+                    chunks += 1
+                for raw_call in delta.get("tool_calls") or []:
+                    if not isinstance(raw_call, Mapping):
+                        continue
+                    index = raw_call.get("index")
+                    if isinstance(index, bool) or not isinstance(index, int):
+                        function = raw_call.get("function")
+                        starts_call = bool(raw_call.get("id")) or (
+                            isinstance(function, Mapping) and bool(function.get("name"))
+                        )
+                        if tool_calls and not starts_call:
+                            index = max(tool_calls)
+                        else:
+                            index = max(tool_calls, default=-1) + 1
+                    call = tool_calls.setdefault(
+                        index,
+                        {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
+                    )
+                    if isinstance(raw_call.get("id"), str):
+                        call["id"] += raw_call["id"]
+                    function = raw_call.get("function")
+                    if isinstance(function, Mapping):
+                        if isinstance(function.get("name"), str):
+                            call["function"]["name"] += function["name"]
+                        if isinstance(function.get("arguments"), str):
+                            call["function"]["arguments"] += function["arguments"]
+
+    if error is None and not saw_done:
+        error = {
+            "error": {
+                "code": "stream_interrupted",
+                "message": "stream ended before [DONE]",
+            }
+        }
+        interrupted = True
+
+    return {
+        "model": payload.get("model"),
+        "choices": [
+            {
+                "message": {
+                    "content": "".join(parts),
+                    "tool_calls": [tool_calls[key] for key in sorted(tool_calls)],
+                }
+            }
+        ],
+        "usage": usage,
+        "_gaugix_stream": {
+            "chunks": chunks,
+            "first_delta_ms": first_delta_ms,
+            "interrupted": interrupted,
+        },
+        "_gaugix_stream_error": error,
+    }
 
 
 def _merge_headers(*sources: Mapping[str, Any]) -> dict[str, str]:
@@ -347,6 +542,7 @@ def validate_direct_harness_config(config: Mapping[str, Any]) -> None:
     _capture_policy(config)
     _header_env_names(config)
     _output_adapter(config)
+    _case_request_overrides_enabled(config)
 
 
 def guardrail_verdict_v1(
@@ -354,6 +550,8 @@ def guardrail_verdict_v1(
     completion: str = "",
     error_body: Mapping[str, Any] | None = None,
     http_status: int | None = None,
+    stream: Mapping[str, Any] | None = None,
+    tool_calls: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Normalize a Gateway result to the guardrail probe's stable v1 contract.
 
@@ -376,8 +574,8 @@ def guardrail_verdict_v1(
         "guard_provider": None,
         "refusal": None,
         "completion": completion,
-        "tool_calls": [],
-        "stream": None,
+        "tool_calls": tool_calls or [],
+        "stream": dict(stream) if stream is not None else None,
     }
     if error_body is None:
         return verdict
@@ -420,6 +618,233 @@ def guardrail_verdict_v1(
     else:
         verdict.update({"verdict": "probe_error", "action": "error"})
     return verdict
+
+
+def case_request_overrides(
+    messages: list[dict[str, str]], config: Mapping[str, Any]
+) -> tuple[list[dict[str, str]], dict[str, Any]]:
+    """Consume a narrowly scoped first-message directive for Direct API tests.
+
+    Cases may select streaming, a token budget, strict structured output and
+    declared function tools.  They cannot select a URL, credential, request
+    header or arbitrary LiteLLM parameter.  The structured options are needed
+    by real-model Guardrail tests: a JSON-Schema ``const`` makes output-side
+    test payloads reproducible, while a forced function schema exercises the
+    real MCP boundary without replacing the business LLM with a stub.
+    """
+    if not _case_request_overrides_enabled(config) or not messages:
+        return messages, {}
+    first = messages[0]
+    if first.get("role") != "system":
+        return messages, {}
+    match = _CASE_DIRECTIVE.fullmatch(first.get("content") or "")
+    if not match:
+        return messages, {}
+    if len(match.group(1).encode("utf-8")) > MAX_CASE_OVERRIDE_BYTES:
+        raise HarnessError(
+            f"@gaugix case request directive exceeds {MAX_CASE_OVERRIDE_BYTES} bytes",
+            retryable=False,
+            kind="config",
+        )
+    try:
+        raw = json.loads(match.group(1))
+    except json.JSONDecodeError as exc:
+        raise HarnessError(
+            f"invalid @gaugix case request directive: {exc}",
+            retryable=False,
+            kind="config",
+        ) from exc
+    if not isinstance(raw, Mapping):
+        raise HarnessError(
+            "@gaugix case request directive must be an object",
+            retryable=False,
+            kind="config",
+        )
+    unknown = set(raw) - {
+        "stream",
+        "max_tokens",
+        "response_format",
+        "tools",
+        "tool_choice",
+    }
+    if unknown:
+        raise HarnessError(
+            "@gaugix case request directive has unsupported keys: "
+            + ", ".join(sorted(str(key) for key in unknown)),
+            retryable=False,
+            kind="config",
+        )
+    overrides: dict[str, Any] = {}
+    if "stream" in raw:
+        if not isinstance(raw["stream"], bool):
+            raise HarnessError("@gaugix stream must be a boolean", retryable=False, kind="config")
+        overrides["stream"] = raw["stream"]
+    if "max_tokens" in raw:
+        value = raw["max_tokens"]
+        if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 4096:
+            raise HarnessError(
+                "@gaugix max_tokens must be an integer from 1 to 4096",
+                retryable=False,
+                kind="config",
+            )
+        overrides["max_tokens"] = value
+    if "response_format" in raw:
+        overrides["response_format"] = _validate_case_response_format(raw["response_format"])
+    tool_names: frozenset[str] = frozenset()
+    if "tools" in raw:
+        tools, tool_names = _validate_case_tools(raw["tools"])
+        overrides["tools"] = tools
+    if "tool_choice" in raw:
+        # ``none`` is also useful when an OpenAI-compatible Gateway adds
+        # server-side MCP tools. It disables those tools for a non-tool case
+        # without letting the case select an arbitrary external capability.
+        if "tools" not in raw and raw["tool_choice"] != "none":
+            raise HarnessError(
+                "@gaugix tool_choice requires tools in the same directive unless it is none",
+                retryable=False,
+                kind="config",
+            )
+        overrides["tool_choice"] = _validate_case_tool_choice(raw["tool_choice"], tool_names)
+    return messages[1:], overrides
+
+
+def _validate_case_response_format(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != {"type", "json_schema"}:
+        raise HarnessError(
+            "@gaugix response_format must be a strict json_schema object",
+            retryable=False,
+            kind="config",
+        )
+    spec = value.get("json_schema")
+    if value.get("type") != "json_schema" or not isinstance(spec, Mapping):
+        raise HarnessError(
+            "@gaugix response_format must use type=json_schema",
+            retryable=False,
+            kind="config",
+        )
+    name = spec.get("name")
+    schema = spec.get("schema")
+    if (
+        not isinstance(name, str)
+        or not _FUNCTION_NAME.fullmatch(name)
+        or spec.get("strict") is not True
+        or not isinstance(schema, Mapping)
+        or set(spec) != {"name", "strict", "schema"}
+    ):
+        raise HarnessError(
+            "@gaugix json_schema needs a valid name, strict=true and an object schema",
+            retryable=False,
+            kind="config",
+        )
+    return cast(dict[str, Any], json.loads(json.dumps(value)))
+
+
+def _validate_case_tools(value: Any) -> tuple[list[dict[str, Any]], frozenset[str]]:
+    if not isinstance(value, list) or not 1 <= len(value) <= 8:
+        raise HarnessError(
+            "@gaugix tools must contain between 1 and 8 function tools",
+            retryable=False,
+            kind="config",
+        )
+    result: list[dict[str, Any]] = []
+    names: set[str] = set()
+    for tool in value:
+        if (
+            not isinstance(tool, Mapping)
+            or set(tool) != {"type", "function"}
+            or tool.get("type") != "function"
+        ):
+            raise HarnessError(
+                "@gaugix tools may contain only OpenAI function definitions",
+                retryable=False,
+                kind="config",
+            )
+        function = tool.get("function")
+        if not isinstance(function, Mapping):
+            raise HarnessError(
+                "@gaugix function definition must be an object",
+                retryable=False,
+                kind="config",
+            )
+        allowed = {"name", "description", "parameters", "strict"}
+        if set(function) - allowed:
+            raise HarnessError(
+                "@gaugix function definition has unsupported keys",
+                retryable=False,
+                kind="config",
+            )
+        name = function.get("name")
+        parameters = function.get("parameters")
+        if (
+            not isinstance(name, str)
+            or not _FUNCTION_NAME.fullmatch(name)
+            or name in names
+            or not isinstance(parameters, Mapping)
+        ):
+            raise HarnessError(
+                "@gaugix functions need unique valid names and object parameters",
+                retryable=False,
+                kind="config",
+            )
+        description = function.get("description")
+        if description is not None and (
+            not isinstance(description, str) or len(description) > 2_000
+        ):
+            raise HarnessError(
+                "@gaugix function description must be at most 2000 characters",
+                retryable=False,
+                kind="config",
+            )
+        if "strict" in function and not isinstance(function["strict"], bool):
+            raise HarnessError(
+                "@gaugix function strict must be a boolean",
+                retryable=False,
+                kind="config",
+            )
+        names.add(name)
+        result.append(json.loads(json.dumps(tool)))
+    return result, frozenset(names)
+
+
+def _validate_case_tool_choice(value: Any, tool_names: frozenset[str]) -> Any:
+    if isinstance(value, str):
+        if value not in {"auto", "none", "required"}:
+            raise HarnessError(
+                "@gaugix string tool_choice must be auto, none or required",
+                retryable=False,
+                kind="config",
+            )
+        return value
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != {"type", "function"}
+        or value.get("type") != "function"
+    ):
+        raise HarnessError(
+            "@gaugix tool_choice must select a declared function",
+            retryable=False,
+            kind="config",
+        )
+    function = value.get("function")
+    name = function.get("name") if isinstance(function, Mapping) else None
+    if not isinstance(function, Mapping) or set(function) != {"name"} or name not in tool_names:
+        raise HarnessError(
+            "@gaugix tool_choice must name one of the directive tools",
+            retryable=False,
+            kind="config",
+        )
+    return json.loads(json.dumps(value))
+
+
+def _case_request_overrides_enabled(config: Mapping[str, Any]) -> bool:
+    value = config.get("allow_case_request_overrides", False)
+    if not isinstance(value, bool):
+        raise HarnessError(
+            "direct harness allow_case_request_overrides must be a boolean",
+            retryable=False,
+            kind="config",
+        )
+    return value
 
 
 def headers_from_env(config: Mapping[str, Any]) -> dict[str, str]:
@@ -562,6 +987,70 @@ def _error_code(body: Mapping[str, Any]) -> str | None:
         return None
     code = error.get("code")
     return code if isinstance(code, str) else None
+
+
+def _stream_info(response: Any) -> dict[str, Any] | None:
+    if not isinstance(response, Mapping):
+        return None
+    value = response.get("_gaugix_stream")
+    return {str(key): item for key, item in value.items()} if isinstance(value, Mapping) else None
+
+
+def _stream_error(response: Any) -> dict[str, Any] | None:
+    if not isinstance(response, Mapping):
+        return None
+    value = response.get("_gaugix_stream_error")
+    return {str(key): item for key, item in value.items()} if isinstance(value, Mapping) else None
+
+
+def _retryable_stream_error(body: Mapping[str, Any]) -> bool:
+    """Apply the ordinary transient-error policy to an in-band SSE error."""
+    code = _error_code(body)
+    if code == "stream_interrupted":
+        return True
+    nested = body.get("error")
+    status = body.get("status_code")
+    if not isinstance(status, int) and isinstance(nested, Mapping):
+        status = nested.get("status_code") or nested.get("status")
+    if isinstance(status, int) and status in {429, 500, 502, 503, 504, 529}:
+        return True
+    haystack = json.dumps(body, ensure_ascii=False, default=str).lower()
+    return any(marker in haystack for marker in RETRYABLE_MARKERS)
+
+
+def _extract_tool_calls(response: Any) -> list[dict[str, Any]]:
+    if isinstance(response, Mapping):
+        choices = response.get("choices") or []
+        first = choices[0] if isinstance(choices, list) and choices else {}
+        message = first.get("message") if isinstance(first, Mapping) else {}
+        raw_calls = message.get("tool_calls") if isinstance(message, Mapping) else []
+    else:
+        try:
+            raw_calls = response.choices[0].message.tool_calls
+        except (AttributeError, IndexError, KeyError):
+            raw_calls = []
+    calls: list[dict[str, Any]] = []
+    for raw in raw_calls or []:
+        if isinstance(raw, Mapping):
+            function = raw.get("function")
+            function = function if isinstance(function, Mapping) else {}
+            calls.append(
+                {
+                    "id": raw.get("id"),
+                    "name": function.get("name"),
+                    "arguments": function.get("arguments"),
+                }
+            )
+            continue
+        function = getattr(raw, "function", None)
+        calls.append(
+            {
+                "id": getattr(raw, "id", None),
+                "name": getattr(function, "name", None),
+                "arguments": getattr(function, "arguments", None),
+            }
+        )
+    return calls
 
 
 def _extract(response: Any, latency_ms: int) -> tuple[str, Usage]:

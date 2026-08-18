@@ -8,9 +8,13 @@ plus a masked suffix (see :func:`provider_key_status`).
 
 from __future__ import annotations
 
+import json
 import os
+import re
+from collections.abc import Mapping
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
 from dotenv import dotenv_values
 from pydantic import Field, field_validator
@@ -132,6 +136,330 @@ def mask_key(value: str) -> str:
     """Render a credential as a non-reversible hint (never the key itself)."""
     tail = value[-4:] if len(value) >= 8 else ""
     return f"…{tail}" if tail else "…"
+
+
+_REDACTED = "[REDACTED]"
+_SECRET_KEYS = {
+    "api_key",
+    "apikey",
+    "authorization",
+    "credential",
+    "credentials",
+    "password",
+    "private_key",
+    "proxy_authorization",
+    "secret",
+    "token",
+    "access_token",
+    "refresh_token",
+    "signing_key",
+    "x_api_key",
+    "x_mt_vk",
+}
+_SECRET_VALUE = re.compile(
+    r"(?i)\b(?:"
+    r"(?:sk|glpat|xox[baprs])-[A-Za-z0-9._-]{8,}|"
+    r"(?:gh[pousr]|github_pat)_[A-Za-z0-9._-]{8,}"
+    r")"
+)
+_KEYED_FIELD_PREFIX = re.compile(
+    r"""(?<![A-Za-z0-9_-])["']?(?P<field>[A-Za-z][A-Za-z0-9_-]*)"""
+    r"""["']?[ \t]*[:=][ \t]*"""
+)
+_HEADER_CONTAINER_KEYS = {"default_headers", "extra_headers", "headers", "request_headers"}
+_PLURAL_SECRET_KEYS = {
+    "access_tokens",
+    "api_keys",
+    "passwords",
+    "private_keys",
+    "refresh_tokens",
+    "secrets",
+    "signing_keys",
+}
+_SAFE_HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
+_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_MAX_REDACTION_DEPTH = 64
+
+
+def redact_for_display(value: Any, *, _parent_key: str = "", _depth: int = 0) -> Any:
+    """Return a JSON-like copy that is safe for APIs and exported reports.
+
+    Frozen profiles should normally contain credential *environment names*, not
+    values.  Imported profiles can still carry literal headers or provider
+    parameters, so every human-facing snapshot gets a final recursive guard.
+    Environment-variable names remain visible because they are reproducibility
+    metadata, not credentials.
+    """
+    if _depth >= _MAX_REDACTION_DEPTH:
+        return _REDACTED
+    parent = _normalize_key(_parent_key)
+    if isinstance(value, Mapping):
+        result: dict[str, Any] = {}
+        next_suffix: dict[str, int] = {}
+        for raw_key, item in value.items():
+            key = str(raw_key)
+            normalized = _normalize_key(key)
+            safe_key = _SECRET_VALUE.sub(_REDACTED, _redact_secret_fields(key))
+            header_value = parent in _HEADER_CONTAINER_KEYS
+            header_name = header_value or parent == "request_headers_from_env"
+            if header_name and _SAFE_HEADER_NAME.fullmatch(key) is None:
+                safe_key = _REDACTED
+            base = safe_key
+            suffix = next_suffix.get(base, 1)
+            safe_key = base if suffix == 1 else f"{base}#{suffix}"
+            while safe_key in result:
+                suffix += 1
+                safe_key = f"{base}#{suffix}"
+            next_suffix[base] = suffix + 1
+            is_env_name = normalized != "request_headers_from_env" and (
+                normalized.endswith("_env") or normalized.endswith("_env_name")
+            )
+            valid_env_name = (
+                is_env_name and isinstance(item, str) and _ENV_NAME.fullmatch(item) is not None
+            )
+            env_reference = parent == "request_headers_from_env"
+            valid_env_reference = (
+                env_reference and isinstance(item, str) and _ENV_NAME.fullmatch(item) is not None
+            )
+            if env_reference and not valid_env_reference:
+                result[safe_key] = _REDACTED
+                continue
+            if is_env_name and not valid_env_name:
+                result[safe_key] = _REDACTED
+                continue
+            plural_secret = normalized in _PLURAL_SECRET_KEYS or (
+                normalized == "tokens" and not isinstance(item, (int, float))
+            )
+            if not env_reference and (
+                (_is_secret_field(normalized) and not is_env_name) or plural_secret or header_value
+            ):
+                result[safe_key] = _REDACTED
+            else:
+                result[safe_key] = redact_for_display(item, _parent_key=key, _depth=_depth + 1)
+        return result
+    if isinstance(value, list):
+        return [
+            redact_for_display(item, _parent_key=_parent_key, _depth=_depth + 1) for item in value
+        ]
+    if isinstance(value, tuple):
+        return [
+            redact_for_display(item, _parent_key=_parent_key, _depth=_depth + 1) for item in value
+        ]
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return _REDACTED
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.startswith(("{", "[")):
+            try:
+                parsed = json.loads(value)
+            except (ValueError, TypeError, RecursionError):
+                pass
+            else:
+                if isinstance(parsed, (dict, list)):
+                    return json.dumps(
+                        redact_for_display(
+                            parsed,
+                            _parent_key=_parent_key,
+                            _depth=_depth + 1,
+                        ),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+        if parent in _HEADER_CONTAINER_KEYS:
+            return _REDACTED
+        return _SECRET_VALUE.sub(_REDACTED, _redact_secret_fields(value))
+    return value
+
+
+def _is_secret_key(normalized: str) -> bool:
+    tokens = normalized.split("_")
+    if normalized in _PLURAL_SECRET_KEYS:
+        return True
+    if any(
+        token in {"credential", "credentials", "password", "passwords", "secret", "secrets"}
+        for token in tokens
+    ):
+        return True
+    return normalized in _SECRET_KEYS or any(
+        normalized.endswith(f"_{secret_key}") for secret_key in _SECRET_KEYS
+    )
+
+
+def _normalize_key(key: str) -> str:
+    with_boundaries = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", key)
+    return re.sub(r"[^a-z0-9]+", "_", with_boundaries.lower()).strip("_")
+
+
+def _is_secret_field(normalized: str) -> bool:
+    return _is_secret_key(normalized) or "authorization" in normalized.split("_")
+
+
+def _search_secret_field(value: str, start: int) -> re.Match[str] | None:
+    """Find the next keyed field whose normalized name is credential-bearing."""
+    cursor = start
+    while match := _KEYED_FIELD_PREFIX.search(value, cursor):
+        if _is_secret_field(_normalize_key(match.group("field"))):
+            return match
+        cursor = match.end()
+    return None
+
+
+def _match_secret_field(value: str, start: int) -> re.Match[str] | None:
+    match = _KEYED_FIELD_PREFIX.match(value, start)
+    if match is not None and _is_secret_field(_normalize_key(match.group("field"))):
+        return match
+    return None
+
+
+def _redact_secret_fields(value: str) -> str:
+    """Mask keyed values in free-form provider text in one linear pass."""
+    out: list[str] = []
+    cursor = 0
+    while match := _search_secret_field(value, cursor):
+        start = match.end()
+        field = _normalize_key(match.group("field"))
+        folded_value = False
+        out.append(value[cursor:start])
+        if start >= len(value):
+            cursor = start
+            break
+
+        if value[start] in "\r\n":
+            index = start
+            if value[index] == "\r":
+                index += 1
+            if index < len(value) and value[index] == "\n":
+                index += 1
+            indent_start = index
+            while index < len(value) and value[index] in " \t":
+                index += 1
+            if index > indent_start and _match_secret_field(value, index) is None:
+                out.append(value[start:index])
+                start = index
+                folded_value = True
+
+        if start >= len(value):
+            out.append(_REDACTED)
+            cursor = start
+            break
+
+        quote = value[start] if value[start] in {'"', "'"} else ""
+        if quote:
+            index = start + 1
+            closed = False
+            while index < len(value):
+                char = value[index]
+                if char == "\\":
+                    index = min(index + 2, len(value))
+                    continue
+                if char == quote:
+                    index += 1
+                    closed = True
+                    break
+                index += 1
+            out.append(f"{quote}{_REDACTED}{quote if closed else ''}")
+            continuation_start = index
+            while continuation_start < len(value) and value[continuation_start] in " \t":
+                continuation_start += 1
+            continued = _consume_indented_continuations(value, continuation_start)
+            cursor = continued if continued > continuation_start else index
+            continue
+
+        if "authorization" in field.split("_"):
+            stop = start
+            while stop < len(value) and value[stop] not in "\r\n":
+                stop += 1
+            line_end = stop
+            stop = _consume_indented_continuations(value, stop, stop_at_secret_field=False)
+            scheme = value[start:line_end].strip().lower()
+            if stop == line_end and scheme in {"basic", "bearer", "token"}:
+                continuation = line_end
+                if continuation < len(value) and value[continuation] == "\r":
+                    continuation += 1
+                if continuation < len(value) and value[continuation] == "\n":
+                    continuation += 1
+                if _KEYED_FIELD_PREFIX.match(value, continuation) is None:
+                    while continuation < len(value) and value[continuation] not in "\r\n":
+                        continuation += 1
+                    stop = _consume_indented_continuations(
+                        value,
+                        continuation,
+                        stop_at_secret_field=False,
+                    )
+            out.append(_REDACTED)
+            cursor = stop
+            continue
+
+        if _match_secret_field(value, start) is not None:
+            out.append(_REDACTED)
+            cursor = start
+            continue
+
+        index = start
+        if folded_value:
+            while index < len(value) and value[index] not in "\r\n":
+                index += 1
+        else:
+            while index < len(value) and value[index] not in " \t\r\n,;}":
+                index += 1
+            scheme = value[start:index].lower()
+            if scheme in {"bearer", "basic"}:
+                whitespace_start = index
+                while index < len(value) and value[index] in " \t\r\n":
+                    index += 1
+                # A folded log may put the next keyed field on the following line.
+                # Preserve that prefix so the outer loop can redact its value too.
+                if _match_secret_field(value, index) is not None:
+                    index = whitespace_start
+                elif index < len(value) and value[index] in {'"', "'"}:
+                    token_quote = value[index]
+                    index += 1
+                    while index < len(value):
+                        char = value[index]
+                        if char == "\\":
+                            index = min(index + 2, len(value))
+                            continue
+                        index += 1
+                        if char == token_quote:
+                            break
+                else:
+                    while index < len(value) and value[index] not in " \t\r\n,;}\"'":
+                        index += 1
+        index = _consume_indented_continuations(value, index)
+        out.append(_REDACTED)
+        cursor = index
+
+    out.append(value[cursor:])
+    return "".join(out)
+
+
+def _consume_indented_continuations(
+    value: str,
+    index: int,
+    *,
+    stop_at_secret_field: bool = True,
+) -> int:
+    """Consume HTTP/YAML-style indented continuation lines after a secret value."""
+    while index < len(value) and value[index] in "\r\n":
+        line_break = index
+        if value[index] == "\r":
+            index += 1
+        if index < len(value) and value[index] == "\n":
+            index += 1
+        indent_start = index
+        while index < len(value) and value[index] in " \t":
+            index += 1
+        if index < len(value) and value[index] in "\r\n":
+            continue
+        if index >= len(value):
+            return index
+        if index == indent_start or (
+            stop_at_secret_field and _match_secret_field(value, index) is not None
+        ):
+            return line_break
+        while index < len(value) and value[index] not in "\r\n":
+            index += 1
+    return index
 
 
 def provider_key_status() -> dict[str, dict[str, object]]:

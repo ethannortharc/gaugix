@@ -514,6 +514,48 @@ async def test_human_score_rejects_an_out_of_range_scorer_index(client):
 # -- re-score (PRD F4.3) -------------------------------------------------------
 
 
+async def test_out_of_band_scoring_refuses_a_live_run(client, session):
+    from gaugix.domain import RunStatus
+    from gaugix.models.runs import Run
+
+    stack = await make_fake_stack(client, "idle-only")
+    eval_set = await make_set(client, name="Live scoring ownership")
+    await make_scored_case(
+        client,
+        eval_set["id"],
+        "Wait for runner",
+        "hello",
+        [{"type": "human", "params": {}, "required": True, "weight": 1}],
+    )
+    created = await client.post(
+        "/api/v1/runs",
+        json={
+            "set_ids": [eval_set["id"]],
+            "executor_ids": [stack["executor"]["id"]],
+            "start": False,
+        },
+    )
+    assert created.status_code == 201, created.text
+    run = created.json()
+    item = (await items_of(client, run["id"]))[0]
+    stored = session.get(Run, run["id"])
+    assert stored is not None
+    stored.status = str(RunStatus.running)
+    session.add(stored)
+    session.commit()
+
+    rescore = await client.post("/api/v1/rescore", json={"run_id": run["id"]})
+    human = await client.post(
+        f"/api/v1/items/{item['id']}/human-score",
+        json={"scorer_index": 0, "passed": True, "note": "too early"},
+    )
+
+    assert rescore.status_code == 422
+    assert human.status_code == 422
+    assert "while execution is active" in rescore.text
+    assert "while execution is active" in human.text
+
+
 async def test_rescoring_after_a_config_fix_changes_the_verdict_without_re_invoking(client):
     """The headline promise: fix the scorer, pay nothing, get the right answer."""
     stack = await make_fake_stack(client, "echo")

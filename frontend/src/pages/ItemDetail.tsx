@@ -101,6 +101,8 @@ export default function ItemDetailPage() {
         </div>
       ) : null}
 
+      <VerdictExplanation item={item} current={current} />
+
       <div className="grid gap-4 lg:grid-cols-[3fr_2fr]">
         <div className="flex min-w-0 flex-col gap-4">
           <Card>
@@ -242,10 +244,103 @@ export default function ItemDetailPage() {
           </Card>
 
           <FrozenScoring scoring={item.case_snapshot.scoring ?? []} />
+          <FrozenConfiguration item={item} current={current} />
         </div>
       </div>
     </>
   )
+}
+
+/** Put the expected outcome, actual outcome and scorer reason in one place. */
+function VerdictExplanation({ item, current }: { item: RunItemDetail; current?: AttemptRead }) {
+  const failures = item.scores
+    .filter((score) => score.passed !== true && score.rationale)
+    .map((score) => ({
+      rationale: score.rationale || '',
+      required: item.case_snapshot.scoring?.[score.scorer_index]?.required ?? true,
+    }))
+  const requiredFailures = failures.filter((failure) => failure.required)
+  const diagnostics = failures.filter((failure) => !failure.required)
+  const actual = compactVerdict(current?.output_text)
+  return (
+    <Card className="mb-4">
+      <CardHeader className="pb-2">
+        <CardTitle>{item.verdict === false ? 'Why this failed' : 'Verdict explanation'}</CardTitle>
+      </CardHeader>
+      <CardContent className="grid gap-3 md:grid-cols-3">
+        <ExplanationCell
+          label="Expected"
+          value={item.reference || describeScoring(item.case_snapshot.scoring ?? [])}
+        />
+        <ExplanationCell
+          label="Actual"
+          value={
+            actual || (current?.error ? `Execution error: ${current.error}` : 'No output yet.')
+          }
+        />
+        <ExplanationCell
+          label="Decision"
+          value={
+            requiredFailures.length
+              ? requiredFailures.map((failure) => failure.rationale).join('\n')
+              : diagnostics.length
+                ? `Required contract passed. Optional diagnostic:\n${diagnostics.map((failure) => failure.rationale).join('\n')}`
+                : item.error ||
+                  item.score_summary ||
+                  (item.verdict === true
+                    ? 'All required scorers passed.'
+                    : 'No scorer explanation was recorded.')
+          }
+          destructive={item.verdict === false || Boolean(item.error)}
+        />
+      </CardContent>
+    </Card>
+  )
+}
+
+function ExplanationCell({
+  label,
+  value,
+  destructive = false,
+}: {
+  label: string
+  value: string
+  destructive?: boolean
+}) {
+  return (
+    <div className="min-w-0 rounded-md border border-[var(--border)] bg-[var(--surface-2)] p-2.5">
+      <div className="mb-1 text-[11px] font-medium uppercase tracking-wide text-[var(--muted-foreground)]">
+        {label}
+      </div>
+      <pre
+        className={`whitespace-pre-wrap break-words font-mono text-xs leading-relaxed ${destructive ? 'text-[var(--destructive)]' : ''}`}
+      >
+        {value}
+      </pre>
+    </div>
+  )
+}
+
+function compactVerdict(output?: string): string {
+  if (!output) return ''
+  try {
+    const value = JSON.parse(output) as Record<string, unknown>
+    if (value.schema_version !== 'guardrail-verdict/v1') return output
+    const keys = ['verdict', 'action', 'rule_id', 'method', 'category', 'http_status', 'error_code']
+    const selected = Object.fromEntries(
+      keys.filter((key) => value[key] !== undefined).map((key) => [key, value[key]]),
+    )
+    return Object.keys(selected).length ? JSON.stringify(selected, null, 2) : output
+  } catch {
+    return output
+  }
+}
+
+function describeScoring(scoring: ScorerSpec[]): string {
+  if (!scoring.length) return 'No expected result or scorer was configured.'
+  return scoring
+    .map((score, index) => `${index + 1}. ${score.type}${score.required ? ' (required)' : ''}`)
+    .join('\n')
 }
 
 /** Index of the first human scorer — the one the review panel resolves. */
@@ -435,6 +530,96 @@ function FrozenScoring({ scoring }: { scoring: ScorerSpec[] }) {
         )}
       </CardContent>
     </Card>
+  )
+}
+
+/** The exact executor and invocation evidence used for this historical item. */
+function FrozenConfiguration({ item, current }: { item: RunItemDetail; current?: AttemptRead }) {
+  const snapshot = item.executor_snapshot
+  return (
+    <Card>
+      <CardHeader className="pb-2">
+        <CardTitle>Execution config (frozen)</CardTitle>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-1.5">
+        {snapshot ? (
+          <>
+            <ConfigRow label="Executor" value={snapshot.key} />
+            <ConfigRow
+              label="Model"
+              value={`${snapshot.model.provider} / ${snapshot.model.model_id}`}
+            />
+            <ConfigRow label="Gateway" value={snapshot.model.base_url || 'provider default'} />
+            <ConfigRow
+              label="Credential"
+              value={snapshot.model.api_key_env || 'provider default'}
+            />
+            <ConfigRow
+              label="Harness"
+              value={`${snapshot.harness.name} (${snapshot.harness.kind})`}
+            />
+            <FrozenJson label="Model parameters" value={snapshot.model.params} />
+            <FrozenJson label="Executor overrides" value={snapshot.overrides} />
+            <FrozenJson label="Harness configuration" value={snapshot.harness.config} />
+          </>
+        ) : (
+          <p className="text-xs text-[var(--muted-foreground)]">
+            This legacy run did not preserve its executor snapshot.
+          </p>
+        )}
+        {current && Object.keys(current.request).length ? (
+          <FrozenJson label="Captured invocation metadata" value={current.request} />
+        ) : null}
+        {current?.messages.length ? (
+          <FrozenJson label="Captured provider messages" value={current.messages} />
+        ) : null}
+        {item.case_snapshot.tags?.length ? (
+          <FrozenJson label="Case tags" value={item.case_snapshot.tags} />
+        ) : null}
+        {item.case_snapshot.notes ? (
+          <div className="rounded-md border border-[var(--border)] px-2.5 py-2 text-xs">
+            <div className="mb-1 font-medium">Case notes</div>
+            <p className="whitespace-pre-wrap text-[var(--muted-foreground)]">
+              {item.case_snapshot.notes}
+            </p>
+          </div>
+        ) : null}
+      </CardContent>
+    </Card>
+  )
+}
+
+function ConfigRow({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex justify-between gap-3 rounded-md border border-[var(--border)] px-2.5 py-1.5 text-xs">
+      <span className="text-[var(--muted-foreground)]">{label}</span>
+      <span className="break-all text-right font-mono">{value}</span>
+    </div>
+  )
+}
+
+function FrozenJson({ label, value }: { label: string; value: unknown }) {
+  const [open, setOpen] = React.useState(false)
+  const text = JSON.stringify(value, null, 2)
+  return (
+    <div className="rounded-md border border-[var(--border)]">
+      <button
+        type="button"
+        className="flex w-full items-center gap-1.5 px-2.5 py-1.5 text-left text-xs hover:bg-[var(--muted)]"
+        onClick={() => setOpen((value) => !value)}
+        aria-expanded={open}
+      >
+        {label}
+        <ChevronDown
+          className={`ml-auto size-3.5 text-[var(--muted-foreground)] transition-transform ${open ? 'rotate-180' : ''}`}
+        />
+      </button>
+      {open ? (
+        <pre className="max-h-72 overflow-auto border-t border-[var(--border)] bg-[var(--muted)] p-2 font-mono text-[11px]">
+          {text}
+        </pre>
+      ) : null}
+    </div>
   )
 }
 

@@ -556,8 +556,17 @@ function ItemTable({ items, showLane }: { items: RunItem[]; showLane: boolean })
               <TableCell>
                 <ScoreBadge verdict={item.verdict} score={item.score_value} />
               </TableCell>
-              <TableCell className="text-xs text-[var(--destructive)]">
-                {item.error ?? ''}
+              <TableCell
+                className={cn(
+                  'max-w-xl text-xs',
+                  item.error || item.verdict === false
+                    ? 'text-[var(--destructive)]'
+                    : 'text-[var(--muted-foreground)]',
+                )}
+              >
+                <Link to={`/items/${item.id}`} className="line-clamp-3 hover:underline">
+                  {item.error ?? item.score_summary ?? ''}
+                </Link>
               </TableCell>
             </TableRow>
           ))}

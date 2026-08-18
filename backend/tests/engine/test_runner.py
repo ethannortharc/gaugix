@@ -19,6 +19,7 @@ from gaugix.engine.runner import (
     recompute_totals,
     registry,
     schedulable_item_ids,
+    set_score_hook,
     start_run,
 )
 from gaugix.models.executors import HarnessProfile
@@ -112,6 +113,43 @@ async def test_serial_concurrency_still_completes(engine, session, demo):
     run = await run_to_completion(engine, run_id)
     assert run.status == str(RunStatus.completed)
     assert run.totals["passed"] == 3
+
+
+async def test_live_totals_move_finished_items_out_of_scoring(engine, session):
+    """The running UI must not wait for finalisation to show terminal counts."""
+    from gaugix.scoring.service import score_item
+
+    cases = [make_case(session, "First", "one"), make_case(session, "Second", "two")]
+    eval_set = make_set(session, "Live totals", cases)
+    executor = make_fake_executor(session, "live totals @ fake")
+    session.commit()
+    second_scored = asyncio.Event()
+    release_second = asyncio.Event()
+    calls = 0
+
+    async def pausing_score_hook(session, item, attempt, executor_snapshot):
+        nonlocal calls
+        outcome = await score_item(session, item, attempt, executor_snapshot)
+        calls += 1
+        if calls == 2:
+            second_scored.set()
+            await release_second.wait()
+        return outcome
+
+    set_score_hook(pausing_score_hook)
+    run_id = plan(session, eval_set.id or 0, [executor.id or 0], concurrency=1)
+    handle = await start_run(engine, run_id)
+    await asyncio.wait_for(second_scored.wait(), timeout=2)
+    try:
+        with Session(engine) as live:
+            run = live.get(Run, run_id)
+            assert run is not None
+            assert run.totals["passed"] == 1
+            assert run.totals["scoring"] == 1
+            assert run.totals["pending"] == 0
+    finally:
+        release_second.set()
+    await asyncio.wait_for(handle.task, timeout=2)
 
 
 # -- retries -------------------------------------------------------------------

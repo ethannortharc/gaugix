@@ -97,13 +97,15 @@ exact structured errors that should become scorer-visible output:
 
 ```json
 {
+  "output_adapter": "guardrail_verdict_v1",
   "capture_http_errors": {
     "status_codes": [403],
     "error_codes": ["guardrails_blocked"]
   },
   "request_headers_from_env": {
     "x-mt-vk": "MT0_EVAL_VK"
-  }
+  },
+  "allow_case_request_overrides": true
 }
 ```
 
@@ -113,6 +115,30 @@ from the Gaugix process environment at invocation time and are never stored in t
 harness profile or frozen run configuration. For this opt-in OpenAI-compatible
 case, Gaugix sends the HTTP request directly so an adapter cannot discard the
 structured error body; ordinary Direct harness calls continue to use LiteLLM.
+
+With `allow_case_request_overrides` enabled, a case may put a first system message
+such as `@gaugix {"stream": true, "max_tokens": 64}` in its frozen input. Gaugix
+removes the directive before invoking the provider and accepts only `stream`,
+`max_tokens`, a strict `response_format.json_schema`, OpenAI function `tools`, and a
+`tool_choice` limited to those declared tools. URL, credentials, headers, model
+selection, and arbitrary provider parameters cannot be overridden by a case. This
+supports mixed streaming, structured-output, tool-boundary, and token-boundary cases
+in one real-API set without turning imported content into a credential or routing
+control plane.
+Per-case streaming currently requires an OpenAI-compatible model profile with an
+explicit `base_url`; Gaugix requests the standard final usage chunk and treats a
+stream that ends without `[DONE]` as a retryable provider error. For an HTTP refusal,
+both configured status and error code must match. An in-band SSE refusal travels over
+HTTP 200, so its configured error code is the capture boundary.
+
+The run item board shows the latest scorer rationale next to every failed row. Item
+drill-down and exported offline HTML reports show the frozen input, expected result,
+actual result, per-scorer decision, case/scoring configuration, executor/model/harness
+snapshot, credential environment-variable name, provider messages, and captured
+invocation metadata. Literal header/token values are recursively redacted before the
+API or report renders them. This distinction is important
+for Guardrails: a structured block can be the expected outcome while still failing an
+optional source-attribution diagnostic if another rule blocked first.
 
 For a single-process production-style build:
 

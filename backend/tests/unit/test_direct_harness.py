@@ -17,6 +17,7 @@ from gaugix.domain import (
     InvokeContext,
     Message,
     ModelSnapshot,
+    Pricing,
     Provider,
     Role,
 )
@@ -181,6 +182,608 @@ async def test_guardrail_adapter_wraps_a_success_and_preserves_completion(monkey
     assert output["completion"] == "safe answer"
     assert result.raw["source_output_text"] == "safe answer"
     assert result.messages[-1] == {"role": "assistant", "content": "safe answer"}
+
+
+async def test_case_request_directive_enables_stream_without_reaching_provider_messages(
+    monkeypatch,
+):
+    import gaugix.harness.direct as direct
+
+    seen = {}
+
+    async def complete(**kwargs):
+        seen.update(kwargs)
+        return {
+            "choices": [{"message": {"content": "ok"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        }
+
+    case = CASE.model_copy(
+        update={
+            "input": [
+                Message(
+                    role=Role.system,
+                    content='@gaugix {"stream": true, "max_tokens": 17}',
+                ),
+                Message(role=Role.user, content="hello"),
+            ]
+        }
+    )
+    monkeypatch.setattr(direct, "_openai_compatible_completion", complete)
+    config = {**ADAPTED, "allow_case_request_overrides": True}
+
+    result = await DirectHarness().invoke(case, MODEL, InvokeContext(harness_config=config))
+
+    assert seen["params"]["stream"] is True
+    assert seen["params"]["max_tokens"] == 17
+    assert seen["messages"] == [{"role": "user", "content": "hello"}]
+    assert json.loads(result.output_text)["verdict"] == "allowed"
+
+
+async def test_stream_directive_uses_real_http_path_without_error_capture(monkeypatch):
+    import gaugix.harness.direct as direct
+
+    seen = {}
+
+    async def complete(**kwargs):
+        seen.update(kwargs)
+        return {
+            "choices": [{"message": {"content": "ok"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            "_gaugix_stream": {"chunks": 1, "first_delta_ms": 1, "interrupted": False},
+            "_gaugix_stream_error": None,
+        }
+
+    case = CASE.model_copy(
+        update={
+            "input": [
+                Message(role=Role.system, content='@gaugix {"stream": true}'),
+                Message(role=Role.user, content="hello"),
+            ]
+        }
+    )
+    monkeypatch.setattr(direct, "_openai_compatible_completion", complete)
+
+    result = await DirectHarness().invoke(
+        case,
+        MODEL,
+        InvokeContext(
+            harness_config={
+                "allow_case_request_overrides": True,
+                "output_adapter": "guardrail_verdict_v1",
+            }
+        ),
+    )
+
+    assert seen["params"]["stream"] is True
+    assert json.loads(result.output_text)["completion"] == "ok"
+
+
+async def test_tool_calls_are_preserved_in_raw_without_output_adapter(monkeypatch):
+    import litellm
+
+    async def complete(**_kwargs):
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call-1",
+                                "type": "function",
+                                "function": {
+                                    "name": "lookup",
+                                    "arguments": '{"id":42}',
+                                },
+                            }
+                        ],
+                    }
+                }
+            ],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        }
+
+    monkeypatch.setattr(litellm, "acompletion", complete)
+    result = await DirectHarness().invoke(CASE, MODEL, InvokeContext(harness_config={}))
+
+    assert result.raw["tool_calls"] == [
+        {
+            "id": "call-1",
+            "name": "lookup",
+            "arguments": '{"id":42}',
+        }
+    ]
+
+
+async def test_stream_directive_rejects_non_openai_compatible_profiles():
+    case = CASE.model_copy(
+        update={
+            "input": [
+                Message(role=Role.system, content='@gaugix {"stream": true}'),
+                Message(role=Role.user, content="hello"),
+            ]
+        }
+    )
+    model = MODEL.model_copy(update={"provider": Provider.anthropic})
+
+    with pytest.raises(HarnessError) as exc:
+        await DirectHarness().invoke(
+            case,
+            model,
+            InvokeContext(harness_config={"allow_case_request_overrides": True}),
+        )
+
+    assert exc.value.kind == "config"
+    assert "OpenAI-compatible" in str(exc.value)
+
+
+async def test_case_request_directive_supports_strict_output_and_declared_tools(
+    monkeypatch,
+):
+    import gaugix.harness.direct as direct
+
+    seen = {}
+
+    async def complete(**kwargs):
+        seen.update(kwargs)
+        return {
+            "choices": [{"message": {"content": '{"payload":"fixed"}'}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        }
+
+    tool_name = "realevaltools-echo_args"
+    directive = {
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "exact_payload",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "properties": {"payload": {"const": "fixed"}},
+                    "required": ["payload"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": tool_name,
+                    "description": "Echo a fixed payload",
+                    "strict": True,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"payload": {"const": "fixed"}},
+                        "required": ["payload"],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        ],
+        "tool_choice": {"type": "function", "function": {"name": tool_name}},
+    }
+    case = CASE.model_copy(
+        update={
+            "input": [
+                Message(
+                    role=Role.system,
+                    content="@gaugix " + json.dumps(directive),
+                ),
+                Message(role=Role.user, content="produce the required payload"),
+            ]
+        }
+    )
+    monkeypatch.setattr(direct, "_openai_compatible_completion", complete)
+
+    await DirectHarness().invoke(
+        case,
+        MODEL,
+        InvokeContext(harness_config={**ADAPTED, "allow_case_request_overrides": True}),
+    )
+
+    assert seen["params"]["response_format"] == directive["response_format"]
+    assert seen["params"]["tools"] == directive["tools"]
+    assert seen["params"]["tool_choice"] == directive["tool_choice"]
+    assert seen["messages"] == [{"role": "user", "content": "produce the required payload"}]
+
+
+async def test_case_request_directive_allows_tool_choice_none_without_tools(monkeypatch):
+    import gaugix.harness.direct as direct
+
+    seen = {}
+
+    async def complete(**params):
+        seen.update(params)
+        return {"choices": [{"message": {"content": "safe"}}]}
+
+    case = CASE.model_copy(
+        update={
+            "input": [
+                Message(role=Role.system, content='@gaugix {"tool_choice": "none"}'),
+                Message(role=Role.user, content="hello"),
+            ]
+        }
+    )
+    monkeypatch.setattr(direct, "_openai_compatible_completion", complete)
+
+    await DirectHarness().invoke(
+        case,
+        MODEL,
+        InvokeContext(harness_config={**ADAPTED, "allow_case_request_overrides": True}),
+    )
+
+    assert seen["params"]["tool_choice"] == "none"
+    assert "tools" not in seen["params"]
+    assert seen["messages"] == [{"role": "user", "content": "hello"}]
+
+
+@pytest.mark.parametrize(
+    "directive",
+    [
+        {"tool_choice": "required"},
+        {
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "declared",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+            "tool_choice": {
+                "type": "function",
+                "function": {"name": "undeclared"},
+            },
+        },
+        {
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "loose",
+                    "strict": False,
+                    "schema": {"type": "object"},
+                },
+            }
+        },
+        {
+            "tools": [
+                {
+                    "type": "mcp",
+                    "server_url": "https://untrusted.invalid/mcp",
+                }
+            ]
+        },
+        {
+            "tools": [
+                {
+                    "type": "web_search",
+                    "function": {
+                        "name": "declared",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ]
+        },
+        {
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "declared",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+            "tool_choice": {
+                "type": "custom",
+                "function": {"name": "declared"},
+            },
+        },
+    ],
+)
+async def test_case_request_directive_rejects_unsafe_structured_overrides(directive):
+    case = CASE.model_copy(
+        update={
+            "input": [
+                Message(
+                    role=Role.system,
+                    content="@gaugix " + json.dumps(directive),
+                ),
+                Message(role=Role.user, content="hello"),
+            ]
+        }
+    )
+
+    with pytest.raises(HarnessError) as exc:
+        await DirectHarness().invoke(
+            case,
+            MODEL,
+            InvokeContext(harness_config={**ADAPTED, "allow_case_request_overrides": True}),
+        )
+
+    assert exc.value.kind == "config"
+
+
+async def test_case_request_directive_rejects_credential_or_url_overrides():
+    case = CASE.model_copy(
+        update={
+            "input": [
+                Message(
+                    role=Role.system,
+                    content='@gaugix {"api_key": "secret", "base_url": "https://evil.invalid"}',
+                ),
+                Message(role=Role.user, content="hello"),
+            ]
+        }
+    )
+
+    with pytest.raises(HarnessError) as exc:
+        await DirectHarness().invoke(
+            case,
+            MODEL,
+            InvokeContext(harness_config={**ADAPTED, "allow_case_request_overrides": True}),
+        )
+
+    assert exc.value.kind == "config"
+    assert "unsupported keys" in str(exc.value)
+
+
+async def test_case_request_directive_rejects_oversized_json_before_parsing():
+    case = CASE.model_copy(
+        update={
+            "input": [
+                Message(
+                    role=Role.system,
+                    content='@gaugix {"padding":"' + ("x" * 33_000) + '"}',
+                ),
+                Message(role=Role.user, content="hello"),
+            ]
+        }
+    )
+
+    with pytest.raises(HarnessError) as exc:
+        await DirectHarness().invoke(
+            case,
+            MODEL,
+            InvokeContext(harness_config={**ADAPTED, "allow_case_request_overrides": True}),
+        )
+
+    assert exc.value.kind == "config"
+    assert "exceeds" in str(exc.value)
+
+
+async def test_real_http_path_collects_streamed_text_and_metadata(monkeypatch):
+    seen = {}
+
+    def handler(request):
+        seen["payload"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            text=(
+                'data: {"choices":[{"delta":{"content":"safe "}}]}\n\n'
+                'data: {"choices":[{"delta":{"content":"answer"}}],'
+                '"usage":{"prompt_tokens":3,"completion_tokens":2}}\n\n'
+                "data: [DONE]\n\n"
+            ),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    use_transport(monkeypatch, handler)
+    import gaugix.harness.direct as direct
+
+    def record_cost(response, *_args):
+        seen["cost_model"] = response.get("model")
+        return None
+
+    monkeypatch.setattr(direct, "resolve_cost", record_cost)
+    case = CASE.model_copy(
+        update={
+            "input": [
+                Message(role=Role.system, content='@gaugix {"stream": true}'),
+                Message(role=Role.user, content="hello"),
+            ]
+        }
+    )
+    config = {**ADAPTED, "allow_case_request_overrides": True}
+
+    result = await DirectHarness().invoke(case, MODEL, InvokeContext(harness_config=config))
+    output = json.loads(result.output_text)
+
+    assert output["completion"] == "safe answer"
+    assert output["stream"]["chunks"] == 2
+    assert output["stream"]["interrupted"] is False
+    assert result.usage.prompt_tokens == 3
+    assert result.usage.completion_tokens == 2
+    assert seen["payload"]["stream_options"] == {"include_usage": True}
+    assert seen["cost_model"] == "openrouter/qwen/qwen3.6-27b"
+
+
+async def test_stream_tool_fragments_without_indices_continue_the_current_call(monkeypatch):
+    def handler(_request):
+        return httpx.Response(
+            200,
+            text=(
+                'data: {"choices":[{"delta":{"tool_calls":[{"id":"call-1",'
+                '"function":{"name":"echo_args","arguments":"{\\"a\\":"}}]}}]}\n\n'
+                'data: {"choices":[{"delta":{"tool_calls":[{"function":'
+                '{"arguments":"1}"}}]}}]}\n\n'
+                "data: [DONE]\n\n"
+            ),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    use_transport(monkeypatch, handler)
+    case = CASE.model_copy(
+        update={
+            "input": [
+                Message(role=Role.system, content='@gaugix {"stream": true}'),
+                Message(role=Role.user, content="hello"),
+            ]
+        }
+    )
+
+    result = await DirectHarness().invoke(
+        case,
+        MODEL,
+        InvokeContext(harness_config={**ADAPTED, "allow_case_request_overrides": True}),
+    )
+    output = json.loads(result.output_text)
+
+    assert output["tool_calls"] == [
+        {
+            "id": "call-1",
+            "name": "echo_args",
+            "arguments": '{"a":1}',
+        }
+    ]
+
+
+async def test_real_http_path_marks_missing_stream_usage_as_unknown_cost(monkeypatch):
+    def handler(_request):
+        return httpx.Response(
+            200,
+            text=('data: {"choices":[{"delta":{"content":"safe"}}]}\n\ndata: [DONE]\n\n'),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    use_transport(monkeypatch, handler)
+    case = CASE.model_copy(
+        update={
+            "input": [
+                Message(role=Role.system, content='@gaugix {"stream": true}'),
+                Message(role=Role.user, content="hello"),
+            ]
+        }
+    )
+    priced = MODEL.model_copy(update={"pricing": Pricing(input_per_1m=1.0, output_per_1m=2.0)})
+
+    result = await DirectHarness().invoke(
+        case,
+        priced,
+        InvokeContext(
+            harness_config={
+                "allow_case_request_overrides": True,
+                "output_adapter": "guardrail_verdict_v1",
+            }
+        ),
+    )
+
+    assert result.usage.prompt_tokens == 0
+    assert result.usage.completion_tokens == 0
+    assert result.usage.cost_usd is None
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n',
+        'data: {"error":"timeout while reading upstream"}\n\n',
+    ],
+)
+async def test_real_http_path_treats_truncated_or_string_error_stream_as_retryable(
+    monkeypatch,
+    event,
+):
+    def handler(_request):
+        return httpx.Response(
+            200,
+            text=event,
+            headers={"content-type": "text/event-stream"},
+        )
+
+    use_transport(monkeypatch, handler)
+    case = CASE.model_copy(
+        update={
+            "input": [
+                Message(role=Role.system, content='@gaugix {"stream": true}'),
+                Message(role=Role.user, content="hello"),
+            ]
+        }
+    )
+
+    with pytest.raises(HarnessError) as exc:
+        await DirectHarness().invoke(
+            case,
+            MODEL,
+            InvokeContext(harness_config={**ADAPTED, "allow_case_request_overrides": True}),
+        )
+
+    assert exc.value.kind == "provider_error"
+    assert exc.value.retryable is True
+
+
+async def test_real_http_path_scores_a_midstream_guardrail_refusal(monkeypatch):
+    def handler(_request):
+        return httpx.Response(
+            200,
+            text=(
+                'data: {"choices":[{"delta":{"content":"prefix"}}]}\n\n'
+                'data: {"error":{"code":"guardrails_blocked","message":"blocked",'
+                '"param":{"rule_id":"kw-deny","method":"keyword"}}}\n\n'
+            ),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    use_transport(monkeypatch, handler)
+    case = CASE.model_copy(
+        update={
+            "input": [
+                Message(role=Role.system, content='@gaugix {"stream": true}'),
+                Message(role=Role.user, content="hello"),
+            ]
+        }
+    )
+    config = {**ADAPTED, "allow_case_request_overrides": True}
+
+    result = await DirectHarness().invoke(case, MODEL, InvokeContext(harness_config=config))
+    output = json.loads(result.output_text)
+
+    assert output["verdict"] == "blocked"
+    assert output["rule_id"] == "kw-deny"
+    assert output["completion"] == "prefix"
+    assert output["stream"]["interrupted"] is True
+    assert result.raw["captured_stream_error"]["error"]["code"] == "guardrails_blocked"
+
+
+async def test_real_http_path_scores_a_pre_stream_http_guardrail_refusal(monkeypatch):
+    body = {
+        "status_code": 403,
+        "type": "guardrails_violation",
+        "error": {
+            "code": "guardrails_blocked",
+            "message": "blocked before streaming",
+            "param": {"rule_id": "kw-deny", "method": "keyword"},
+        },
+    }
+
+    def handler(_request):
+        return httpx.Response(403, json=body)
+
+    use_transport(monkeypatch, handler)
+    case = CASE.model_copy(
+        update={
+            "input": [
+                Message(role=Role.system, content='@gaugix {"stream": true}'),
+                Message(role=Role.user, content="hello"),
+            ]
+        }
+    )
+
+    result = await DirectHarness().invoke(
+        case,
+        MODEL,
+        InvokeContext(harness_config={**ADAPTED, "allow_case_request_overrides": True}),
+    )
+    output = json.loads(result.output_text)
+
+    assert output["verdict"] == "blocked"
+    assert output["http_status"] == 403
+    assert output["rule_id"] == "kw-deny"
+    assert result.raw["captured_http_error"]["body"] == body
 
 
 async def test_capture_path_matches_litellm_key_fallback_and_default_timeout(monkeypatch):
