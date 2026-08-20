@@ -22,6 +22,7 @@ from sqlmodel import Session, col, select
 from gaugix import coverage
 from gaugix.domain import ExecutorSnapshot, ItemStatus, RunStatus, ScorerSpec, ScorerType
 from gaugix.errors import NotFoundError, ValidationError
+from gaugix.hierarchy import frozen_nodes, node_map, nodes_for_set, path_nodes
 from gaugix.models.cases import EvalCase, EvalSet, SetMembership
 from gaugix.models.executors import Executor, HarnessProfile, ModelProfile
 from gaugix.models.runs import Run, RunItem
@@ -47,6 +48,16 @@ class PlanRequest:
 class PlannedRun:
     run: Run
     item_count: int
+
+
+@dataclass(slots=True)
+class PlannedCaseEntry:
+    """A case plus the set-specific organisation frozen into a run item."""
+
+    case: EvalCase
+    membership: SetMembership
+    node_path: list[str]
+    node_path_ids: list[int]
 
 
 def resolve_scoring(case: EvalCase, eval_set: EvalSet) -> list[ScorerSpec]:
@@ -146,10 +157,13 @@ def plan_run(session: Session, request: PlanRequest) -> PlannedRun:
     executors = load_executor_snapshots(session, request.executor_ids)
     case_ids = request.case_ids
 
-    planned_cases = {
-        eval_set.id: _cases_in_set(session, eval_set.id or 0, case_ids) for eval_set in sets
+    planned_entries = {
+        eval_set.id: _case_entries_in_set(session, eval_set.id or 0, case_ids) for eval_set in sets
     }
-    selected = sum(len(v) for v in planned_cases.values())
+    planned_cases = {
+        set_key: [entry.case for entry in entries] for set_key, entries in planned_entries.items()
+    }
+    selected = sum(len(v) for v in planned_entries.values())
 
     run = Run(
         name=request.name
@@ -191,6 +205,14 @@ def plan_run(session: Session, request: PlanRequest) -> PlannedRun:
                 # nothing at all and produces a report that can name its
                 # dataset (D-066).
                 **_provenance(session, s),
+                # Metrics are part of the measurement contract. A later edit
+                # to the set must not reinterpret a historical run's labels or
+                # predictions, so freeze the generic profile beside coverage.
+                "evaluation_profile": s.evaluation_profile.model_dump(mode="json"),
+                # Branch descriptions, source links and ancestry are frozen as
+                # report metadata. Run items separately freeze their own path
+                # so node-scoped rollups never depend on the live tree.
+                "nodes": _frozen_set_nodes(session, s),
             }
             for s in sets
         ],
@@ -212,17 +234,21 @@ def plan_run(session: Session, request: PlanRequest) -> PlannedRun:
     for executor in executors:
         position = 0
         for eval_set in sets:
-            for case in planned_cases[eval_set.id]:
+            for entry in planned_entries[eval_set.id]:
+                case = entry.case
                 item = RunItem(
                     run_id=run.id or 0,
                     set_id=eval_set.id,
                     set_name=eval_set.name,
                     case_id=case.id,
+                    node_id=entry.membership.node_id,
                     executor_key=executor.key,
                     position=position,
                     status=str(ItemStatus.pending),
                 )
                 item.case_snapshot = case.to_snapshot(resolve_scoring(case, eval_set))
+                item.node_path = entry.node_path
+                item.node_path_ids = entry.node_path_ids
                 session.add(item)
                 position += 1
                 item_count += 1
@@ -312,6 +338,15 @@ def _provenance(session: Session, eval_set: EvalSet) -> dict[str, Any]:
     return {"provenance": record} if record else {}
 
 
+def _frozen_set_nodes(session: Session, eval_set: EvalSet) -> list[dict[str, Any]]:
+    nodes = nodes_for_set(session, eval_set.id or 0)
+    if not nodes:
+        return []
+    from gaugix.benchmarks import effective_provenance
+
+    return frozen_nodes(nodes, effective_provenance(session, eval_set))
+
+
 def _load_sets(session: Session, set_ids: list[int]) -> list[EvalSet]:
     sets: list[EvalSet] = []
     for set_id in set_ids:
@@ -331,8 +366,14 @@ def _cases_in_set(
     selects: an id that belongs to no chosen set simply contributes nothing,
     which is what makes "run these nine cases" work across a multi-set choice.
     """
+    return [entry.case for entry in _case_entries_in_set(session, set_id, case_ids)]
+
+
+def _case_entries_in_set(
+    session: Session, set_id: int, case_ids: list[int] | None = None
+) -> list[PlannedCaseEntry]:
     statement = (
-        select(EvalCase)
+        select(EvalCase, SetMembership)
         .join(SetMembership, col(SetMembership.case_id) == col(EvalCase.id))
         .where(SetMembership.set_id == set_id, col(EvalCase.deleted_at).is_(None))
     )
@@ -340,4 +381,17 @@ def _cases_in_set(
         if not case_ids:
             return []
         statement = statement.where(col(EvalCase.id).in_(case_ids))
-    return list(session.exec(statement.order_by(col(SetMembership.position))).all())
+    rows = session.exec(statement.order_by(col(SetMembership.position))).all()
+    by_id = node_map(nodes_for_set(session, set_id))
+    result: list[PlannedCaseEntry] = []
+    for case, membership in rows:
+        path = path_nodes(by_id, membership.node_id)
+        result.append(
+            PlannedCaseEntry(
+                case=case,
+                membership=membership,
+                node_path=[node.name for node in path],
+                node_path_ids=[node.id for node in path if node.id is not None],
+            )
+        )
+    return result

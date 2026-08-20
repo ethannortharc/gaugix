@@ -27,6 +27,7 @@ export interface SetRef {
   id: number
   name: string
   position: number
+  node_id: number | null
 }
 
 export interface EvalCase {
@@ -42,6 +43,47 @@ export interface EvalCase {
   updated_at: string
   sets: SetRef[]
   position: number | null
+  node_id: number | null
+  node_path: string[]
+}
+
+export interface EvaluationValueSource {
+  source: 'tag' | 'reference' | 'output_json'
+  key: string | null
+}
+
+export interface EvaluationProfile {
+  kind: 'standard' | 'binary_classification'
+  name: string
+  description: string | null
+  truth: EvaluationValueSource | null
+  prediction: EvaluationValueSource | null
+  score: EvaluationValueSource | null
+  score_scale: '0-1' | '0-100'
+  category_truth: EvaluationValueSource | null
+  category_prediction: EvaluationValueSource | null
+  positive_values: string[]
+  negative_values: string[]
+  positive_label: string
+  negative_label: string
+  false_positive_label: string
+}
+
+export const STANDARD_EVALUATION_PROFILE: EvaluationProfile = {
+  kind: 'standard',
+  name: 'Standard evaluation',
+  description: null,
+  truth: null,
+  prediction: null,
+  score: null,
+  score_scale: '0-1',
+  category_truth: null,
+  category_prediction: null,
+  positive_values: ['positive'],
+  negative_values: ['negative'],
+  positive_label: 'positive',
+  negative_label: 'negative',
+  false_positive_label: 'False positive rate',
 }
 
 /**
@@ -83,12 +125,57 @@ export interface EvalSet {
   description: string | null
   tags: string[]
   default_scoring: ScorerSpec[]
+  evaluation_profile: EvaluationProfile
+  collection_id: number | null
+  collection_key: string | null
+  collection_path: string[]
+  logical_key: string | null
+  variant: string | null
+  visibility: 'primary' | 'fixture' | 'hidden'
   case_count: number
   deleted_at: string | null
   created_at: string
   updated_at: string
   /** Empty for hand-made sets. */
   provenance: SetProvenance
+}
+
+export interface EvalCollection {
+  id: number
+  key: string
+  name: string
+  description: string | null
+  parent_id: number | null
+  position: number
+  visibility: 'primary' | 'fixture' | 'hidden'
+  tags: string[]
+  provenance: Record<string, unknown>
+  path: string[]
+  depth: number
+  direct_set_count: number
+  descendant_set_count: number
+  direct_case_count: number
+  descendant_case_count: number
+  created_at: string
+  updated_at: string
+}
+
+export interface EvalSetNode {
+  id: number
+  set_id: number
+  parent_id: number | null
+  name: string
+  description: string | null
+  position: number
+  tags: string[]
+  provenance: Record<string, unknown>
+  effective_provenance: Record<string, unknown>
+  path: string[]
+  depth: number
+  direct_case_count: number
+  descendant_case_count: number
+  created_at: string
+  updated_at: string
 }
 
 export interface CountResponse {
@@ -155,6 +242,7 @@ export interface CaseIO {
   scoring?: ScorerSpec[]
   tags?: string[]
   notes?: string | null
+  group_path?: string[]
 }
 
 export const SCORER_TYPES: ScorerType[] = [
@@ -288,9 +376,98 @@ export interface ExecutorSnapshot {
 
 export interface RunConfig {
   executors: ExecutorSnapshot[]
-  sets: { id: number; name: string }[]
+  sets: {
+    id: number
+    name: string
+    evaluation_profile?: EvaluationProfile
+    nodes?: Array<Record<string, unknown>>
+  }[]
   concurrency: number
   auto_score: boolean
+}
+
+// -- task-aware metrics -------------------------------------------------------
+
+export interface MetricValue {
+  key: string
+  label: string
+  value: number | null
+  unit: string
+  numerator: number | null
+  denominator: number | null
+  hint: string | null
+  unavailable_reason: string | null
+}
+
+export interface ConfusionMatrix {
+  tp: number
+  fp: number
+  fn: number
+  tn: number
+  positive_label: string
+  negative_label: string
+}
+
+export interface CategoryMetric {
+  category: string
+  support: number
+  predicted: number
+  correct: number
+  precision: number | null
+  recall: number | null
+  f1: number | null
+}
+
+export interface ThresholdPoint {
+  threshold: number
+  precision: number | null
+  recall: number | null
+  false_positive_rate: number | null
+}
+
+export interface EvaluationSlice {
+  set_id: number | null
+  set_name: string
+  executor_key: string
+  node_id: number | null
+  node_path: string[]
+  profile: EvaluationProfile
+  coverage: {
+    items: number
+    valid: number
+    execution_errors: number
+    missing_truth: number
+    missing_prediction: number
+  }
+  metrics: MetricValue[]
+  confusion: ConfusionMatrix | null
+  categories: CategoryMetric[]
+  threshold_curve: ThresholdPoint[]
+}
+
+export interface RunEvaluation {
+  run_id: number
+  slices: EvaluationSlice[]
+}
+
+// -- Playground ---------------------------------------------------------------
+
+export interface PlaygroundResponse {
+  ok: boolean
+  executor_key: string
+  output_text: string
+  parsed_output: unknown | null
+  messages: Array<Record<string, unknown>>
+  usage: {
+    prompt_tokens: number
+    completion_tokens: number
+    cost_usd: number | null
+    latency_ms: number
+  }
+  raw: Record<string, unknown>
+  artifacts: { kind: string; filename: string; mime: string }[]
+  error: string | null
+  error_kind: string | null
 }
 
 export interface Run {

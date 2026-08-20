@@ -205,6 +205,57 @@ footer dd { margin: 2px 0 0; }
   </table>
 </div>
 
+{% if evaluation and evaluation.slices %}
+<h2>Evaluation profile metrics</h2>
+<p class="rule-note">
+  These metrics use the task semantics frozen into the run. Editing the live set later does not
+  reinterpret this report.
+</p>
+{% for slice in evaluation.slices %}
+<div class="card">
+  <h3 style="margin-top:0">{{ slice.set_name }} × {{ slice.executor_key }}</h3>
+  <p class="sub">
+    {{ slice.profile.name }} · {{ slice.coverage.valid }} of {{ slice.coverage['items'] }} items metric-ready
+    {%- if slice.coverage.execution_errors %} · {{ slice.coverage.execution_errors }} execution errors{% endif %}
+  </p>
+  <section class="tiles" style="margin-top:12px">
+    {% for metric in slice.metrics %}
+    <div class="tile">
+      <div class="label">{{ metric.label }}</div>
+      <div class="value small">{{ metric.value | measure(metric.unit) }}</div>
+      {% if metric.numerator is not none and metric.denominator is not none %}
+      <div class="rule-note">{{ metric.numerator }}/{{ metric.denominator }}</div>
+      {% elif metric.unavailable_reason %}
+      <div class="rule-note">{{ metric.unavailable_reason }}</div>
+      {% endif %}
+    </div>
+    {% endfor %}
+  </section>
+  {% if slice.confusion %}
+  <h3>Confusion matrix</h3>
+  <table>
+    <thead><tr><th></th><th class="n">Pred. {{ slice.confusion.positive_label }}</th><th class="n">Pred. {{ slice.confusion.negative_label }}</th></tr></thead>
+    <tbody>
+      <tr><td>Actual {{ slice.confusion.positive_label }}</td><td class="n">{{ slice.confusion.tp }}</td><td class="n">{{ slice.confusion.fn }}</td></tr>
+      <tr><td>Actual {{ slice.confusion.negative_label }}</td><td class="n">{{ slice.confusion.fp }}</td><td class="n">{{ slice.confusion.tn }}</td></tr>
+    </tbody>
+  </table>
+  {% endif %}
+  {% if slice.categories %}
+  <h3>Category attribution</h3>
+  <table>
+    <thead><tr><th>Category</th><th class="n">Support</th><th class="n">Precision</th><th class="n">Recall</th><th class="n">F1</th></tr></thead>
+    <tbody>
+      {% for row in slice.categories %}
+      <tr><td>{{ row.category }}</td><td class="n">{{ row.support }}</td><td class="n">{{ row.precision | measure }}</td><td class="n">{{ row.recall | measure }}</td><td class="n">{{ row.f1 | measure }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</div>
+{% endfor %}
+{% endif %}
+
 {% if aggregate and aggregate.rows | length > 1 %}
 <h2>By set</h2>
 <div class="card">

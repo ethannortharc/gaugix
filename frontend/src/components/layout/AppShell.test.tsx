@@ -29,7 +29,16 @@ describe('AppShell', () => {
 
   it('renders every top-level nav destination', () => {
     renderRoutes(routes)
-    for (const label of ['Dashboard', 'Eval sets', 'Executors', 'Runs', 'Compare', 'Settings']) {
+    for (const label of [
+      'Home',
+      'Playground',
+      'Eval sets',
+      'New evaluation',
+      'Executors',
+      'Runs',
+      'Compare',
+      'Settings',
+    ]) {
       expect(screen.getByRole('link', { name: label })).toBeInTheDocument()
     }
   })
@@ -67,9 +76,9 @@ describe('AppShell', () => {
     expect(screen.getByTestId('health-chip')).toHaveTextContent('offline')
   })
 
-  it('renders the dashboard at the index route', () => {
+  it('renders home at the index route', () => {
     renderRoutes(routes)
-    expect(screen.getByRole('heading', { name: 'Dashboard' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Home' })).toBeInTheDocument()
   })
 
   it('renders a not-found page for unknown routes', () => {

@@ -1,13 +1,20 @@
-import { Check, Layers, Play, PlayCircle } from 'lucide-react'
+import {
+  ArrowRight,
+  BarChart3,
+  Check,
+  Layers,
+  MessageSquareText,
+  Play,
+  PlayCircle,
+} from 'lucide-react'
 import * as React from 'react'
 import { Link } from 'react-router-dom'
 import { toast } from 'sonner'
 
-import { useCases, useSetOptions } from '@/api/cases'
-import { useExecutors, useResumeRun, useRuns, useSetTrends } from '@/api/runs'
+import { useCases, useCollections, useSetOptions } from '@/api/cases'
+import { useExecutors, useResumeRun, useRuns } from '@/api/runs'
 import { PageHeader } from '@/components/layout/AppShell'
-import { RunStatusBadge, Sparkline, Stat } from '@/components/RunBits'
-import { TruncatedNotice } from '@/components/LoadMore'
+import { RunStatusBadge, Stat } from '@/components/RunBits'
 import { ErrorState, LoadingState } from '@/components/states'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -20,10 +27,10 @@ export default function DashboardPage() {
   // One row, fetched only for its X-Total-Count header: the library's size.
   const allCases = useCases({ limit: 1 })
   const executors = useExecutors()
-  const trends = useSetTrends()
+  const suites = useCollections({ roots_only: true, visibility: ['primary'] })
   const resume = useResumeRun()
 
-  const loading = runs.isLoading || sets.isLoading
+  const loading = runs.isLoading || sets.isLoading || suites.isLoading
   const runRows = React.useMemo(() => runs.data?.items ?? [], [runs.data])
   const setRows = sets.data?.items ?? []
   const executorRows = executors.data?.items ?? []
@@ -43,55 +50,17 @@ export default function DashboardPage() {
   // had created a set and nothing else on an empty dashboard with no next step.
   const setupIncomplete = setRows.length === 0 || executorRows.length === 0 || runRows.length === 0
 
-  /**
-   * Pass rate per set across recent runs, oldest first.
-   *
-   * The server splits this per set. It used to be derived here from each run's
-   * *overall* rate, which meant a run covering three sets plotted one identical
-   * number on all three lines — one set's regression showed up in its
-   * neighbours' history, and a healthy set inherited a sick one's dip.
-   */
-  const setHistory = React.useMemo(() => {
-    const history = new Map<number, number[]>()
-    for (const trend of trends.data ?? []) {
-      history.set(
-        trend.set_id,
-        trend.points.map((p) => p.pass_rate),
-      )
-    }
-    return history
-  }, [trends.data])
-
-  /*
-    The server leaves partial runs out of these lines: a rate over two of five
-    cases has nothing to do with a rate over five, and plotting them together
-    is how "Guardrail regression: 100%" came to mean two passing cases. The
-    count comes back so the shorter line can be explained (D-053).
-  */
-  const excludedPartials = React.useMemo(() => {
-    const excluded = new Map<number, number>()
-    for (const trend of trends.data ?? []) {
-      if (trend.partial_runs_excluded > 0) excluded.set(trend.set_id, trend.partial_runs_excluded)
-    }
-    return excluded
-  }, [trends.data])
-
-  const baselineSets = React.useMemo(
-    () => new Set(runRows.flatMap((run) => run.is_baseline_for)),
-    [runRows],
-  )
-
   return (
     <>
       <PageHeader
-        title="Dashboard"
-        description="Where things stand, and what is waiting on you."
+        title="Home"
+        description="Move from a manual probe to a repeatable evaluation, then review and compare."
         actions={
           runRows.length > 0 || executorRows.length > 0 ? (
             <Button asChild size="sm">
               <Link to="/runs/new">
                 <Play />
-                New run
+                New evaluation
               </Link>
             </Button>
           ) : null
@@ -111,6 +80,7 @@ export default function DashboardPage() {
               hasRun={runRows.length > 0}
             />
           ) : null}
+          <WorkflowActions />
           <Card>
             <CardContent className="flex flex-wrap items-center gap-x-10 gap-y-3 p-4">
               <Stat label="eval sets" value={setTotal} />
@@ -243,14 +213,14 @@ export default function DashboardPage() {
 
           <Card>
             <CardHeader className="pb-2">
-              <CardTitle>Eval sets</CardTitle>
+              <CardTitle>Evaluation suites</CardTitle>
               <CardDescription>
-                Pass rate over this set’s recent runs, oldest first. A set with no baseline has
-                nothing to regress against.
+                The primary library is organised into a few decision-oriented suites. Drill down
+                only when you need a set, variant, branch, or individual case.
               </CardDescription>
             </CardHeader>
             <CardContent className="flex flex-col gap-1">
-              {setRows.length === 0 ? (
+              {(suites.data?.items ?? []).length === 0 ? (
                 <Button asChild size="sm" variant="outline" className="self-start">
                   <Link to="/sets">
                     <Layers />
@@ -258,62 +228,92 @@ export default function DashboardPage() {
                   </Link>
                 </Button>
               ) : (
-                setRows.map((set) => {
-                  const history = setHistory.get(set.id) ?? []
-                  const latest = history.at(-1) ?? null
-                  const hasBaseline = baselineSets.has(set.id)
-                  const skipped = excludedPartials.get(set.id) ?? 0
-                  return (
-                    <div
-                      key={set.id}
-                      className="flex flex-wrap items-center gap-3 rounded-md border border-[var(--border)] px-2.5 py-2"
-                    >
-                      <Link
-                        to={`/sets/${set.id}`}
-                        className="min-w-0 flex-1 truncate text-sm font-medium hover:underline"
-                      >
-                        {set.name}
-                      </Link>
-                      <span className="tabular text-xs text-[var(--muted-foreground)]">
-                        {set.case_count} {pluralize(set.case_count, 'case')}
-                      </span>
-                      {hasBaseline ? (
-                        <Badge variant="primary">baseline set</Badge>
-                      ) : (
-                        <Badge variant="outline" title="Mark a run as baseline to enable the diff">
-                          no baseline
-                        </Badge>
-                      )}
-                      {skipped > 0 ? (
-                        <Badge
-                          variant="outline"
-                          title={`${skipped} run(s) covered only part of this set. Their pass rates describe those cases, not the set, so they are not on this line.`}
-                        >
-                          {skipped} partial {pluralize(skipped, 'run')} not shown
-                        </Badge>
-                      ) : null}
-                      <Sparkline values={history} />
-                      <span className="tabular w-16 text-right text-xs">
-                        {latest === null ? '—' : `${Math.round(latest)}%`}
-                      </span>
-                    </div>
-                  )
-                })
+                (suites.data?.items ?? []).map((suite) => (
+                  <Link
+                    key={suite.id}
+                    to={`/collections/${suite.id}`}
+                    className="flex flex-wrap items-center gap-3 rounded-md border border-[var(--border)] px-2.5 py-2 transition-colors hover:border-[var(--primary)]/50"
+                  >
+                    <span className="min-w-0 flex-1 truncate text-sm font-medium">
+                      {suite.name}
+                    </span>
+                    <Badge variant="outline">{suite.descendant_set_count} sets</Badge>
+                    <Badge variant="outline">{suite.descendant_case_count} cases</Badge>
+                    <ArrowRight className="size-3.5 text-[var(--muted-foreground)]" />
+                  </Link>
+                ))
               )}
-              {/* This card lists sets, so past the ceiling it is listing some
-                  of them. The tile above already counts the whole library, and
-                  the two disagreeing without explanation is worse than either. */}
-              <TruncatedNotice
-                shown={setRows.length}
-                total={setTotal}
-                noun="set"
-                hint="Open the library to see the rest."
-              />
             </CardContent>
           </Card>
         </div>
       )}
     </>
+  )
+}
+
+function WorkflowActions() {
+  const actions = [
+    {
+      step: '01',
+      title: 'Test manually',
+      description: 'Try a conversation and inspect the raw model response.',
+      to: '/playground',
+      icon: MessageSquareText,
+    },
+    {
+      step: '02',
+      title: 'Build the eval',
+      description: 'Organise durable cases, branches, sources and metric semantics.',
+      to: '/sets',
+      icon: Layers,
+    },
+    {
+      step: '03',
+      title: 'Run evaluation',
+      description: 'Choose sets and executors; preflight before provider spend.',
+      to: '/runs/new',
+      icon: PlayCircle,
+    },
+    {
+      step: '04',
+      title: 'Review & compare',
+      description: 'Resolve human items, inspect failures and measure regressions.',
+      to: '/compare',
+      icon: BarChart3,
+    },
+  ]
+  return (
+    <section aria-labelledby="workflow-heading">
+      <div className="mb-2 flex items-center justify-between">
+        <h2
+          id="workflow-heading"
+          className="text-xs font-semibold uppercase tracking-wide text-[var(--muted-foreground)]"
+        >
+          Evaluation workflow
+        </h2>
+      </div>
+      <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+        {actions.map(({ step, title, description, to, icon: Icon }) => (
+          <Link
+            key={step}
+            to={to}
+            className="group flex min-h-28 flex-col rounded-lg border border-[var(--border)] bg-[var(--card)] p-3 transition-colors hover:border-[var(--primary)]/50"
+          >
+            <div className="flex items-center justify-between">
+              <span className="text-[10px] font-semibold tracking-widest text-[var(--primary)]">
+                {step}
+              </span>
+              <Icon className="size-4 text-[var(--muted-foreground)] transition-colors group-hover:text-[var(--primary)]" />
+            </div>
+            <h3 className="mt-3 text-sm font-semibold">{title}</h3>
+            <p className="mt-1 flex-1 text-xs leading-relaxed text-[var(--muted-foreground)]">
+              {description}
+            </p>
+            <ArrowRight className="mt-2 size-3.5 self-end text-[var(--muted-foreground)] transition-transform group-hover:translate-x-0.5" />
+          </Link>
+        ))}
+      </div>
+    </section>
   )
 }
 

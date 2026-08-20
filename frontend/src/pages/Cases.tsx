@@ -1,12 +1,14 @@
-import { FileUp, FolderInput, Layers, ListPlus, RotateCcw, Search, Trash2, X } from 'lucide-react'
+import { FolderInput, Layers, ListPlus, RotateCcw, Search, Trash2, X } from 'lucide-react'
 import * as React from 'react'
 import { Link } from 'react-router-dom'
 import { toast } from 'sonner'
 
 import { useBulkCaseOp, useCases, useSetOptions } from '@/api/cases'
 import type { EvalCase } from '@/api/types'
+import { AddCasesDialog, type AddCasesMethod } from '@/components/AddCasesDialog'
 import { CaseEditorDialog } from '@/components/CaseEditorDialog'
 import { ConfirmDialog } from '@/components/ConfirmDialog'
+import { GenerateDialog } from '@/components/GenerateDialog'
 import { ImportDialog } from '@/components/ImportDialog'
 import { PageHeader } from '@/components/layout/AppShell'
 import { LoadMore, TruncatedNotice } from '@/components/LoadMore'
@@ -52,7 +54,9 @@ export default function CasesPage() {
   const [tagFilter, setTagFilter] = React.useState<string[]>([])
   const [selected, setSelected] = React.useState<Set<number>>(new Set())
   const [editing, setEditing] = React.useState<EvalCase | 'new' | null>(null)
+  const [adding, setAdding] = React.useState(false)
   const [importing, setImporting] = React.useState(false)
+  const [generating, setGenerating] = React.useState(false)
 
   const { limit, more, reset } = usePagedLimit()
   // Every set, so the filter can name every set (D-064).
@@ -87,27 +91,23 @@ export default function CasesPage() {
 
   const allSelected = cases.length > 0 && selected.size === cases.length
 
+  function chooseAddMethod(method: AddCasesMethod) {
+    setAdding(false)
+    if (method === 'manual') setEditing('new')
+    if (method === 'import') setImporting(true)
+    if (method === 'ai') setGenerating(true)
+  }
+
   return (
     <>
       <PageHeader
         title="Case library"
         description="Every case you have written or imported. Cases belong here, not to a set — a set is one ordered view over them."
         actions={
-          <>
-            {/*
-              Import belonged here as much as on a set page: a case does not
-              need a set to exist, and requiring one to import was the same
-              set-shaped assumption this page was built to undo.
-            */}
-            <Button variant="outline" size="sm" onClick={() => setImporting(true)}>
-              <FileUp />
-              Import
-            </Button>
-            <Button size="sm" onClick={() => setEditing('new')}>
-              <ListPlus />
-              New case
-            </Button>
-          </>
+          <Button size="sm" onClick={() => setAdding(true)}>
+            <ListPlus />
+            Add cases
+          </Button>
         }
       />
 
@@ -220,9 +220,9 @@ export default function CasesPage() {
           action={
             scope === 'all' && !q ? (
               <div className="flex flex-wrap justify-center gap-2">
-                <Button size="sm" onClick={() => setEditing('new')}>
+                <Button size="sm" onClick={() => setAdding(true)}>
                   <ListPlus />
-                  New case
+                  Add cases
                 </Button>
                 <Button asChild variant="outline" size="sm">
                   <Link to="/benchmarks">Browse benchmarks</Link>
@@ -339,8 +339,10 @@ export default function CasesPage() {
         onOpenChange={(open) => !open && setEditing(null)}
         caseData={editing === 'new' ? null : editing}
       />
+      <AddCasesDialog open={adding} onOpenChange={setAdding} onChoose={chooseAddMethod} />
       {/* No `setId`: cases imported here are unfiled until a set claims them. */}
       <ImportDialog open={importing} onOpenChange={setImporting} />
+      <GenerateDialog open={generating} onOpenChange={setGenerating} />
     </>
   )
 }

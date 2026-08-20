@@ -1,7 +1,7 @@
 import { screen } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-import type { EvalSet } from '@/api/types'
+import { STANDARD_EVALUATION_PROFILE, type EvalSet } from '@/api/types'
 import RunNewPage from '@/pages/RunNew'
 import { renderWithProviders } from '@/test/utils'
 
@@ -12,6 +12,13 @@ function makeSet(id: number): EvalSet {
     description: null,
     tags: [],
     default_scoring: [],
+    evaluation_profile: STANDARD_EVALUATION_PROFILE,
+    collection_id: null,
+    collection_key: null,
+    collection_path: [],
+    logical_key: null,
+    variant: null,
+    visibility: 'primary',
     case_count: 1,
     deleted_at: null,
     created_at: '2026-08-01T00:00:00Z',

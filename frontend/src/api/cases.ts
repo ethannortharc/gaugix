@@ -4,7 +4,10 @@ import { apiFetch, apiFetchList, buildQuery } from '@/api/client'
 import type {
   CountResponse,
   EvalCase,
+  EvalCollection,
   EvalSet,
+  EvalSetNode,
+  EvaluationProfile,
   ExportFormat,
   FieldMapping,
   GenPromptResponse,
@@ -22,6 +25,9 @@ export const qk = {
   set: (id: number) => ['set', id] as const,
   setCases: (id: number, filters?: Record<string, unknown>) =>
     ['set', id, 'cases', filters ?? {}] as const,
+  setNodes: (id: number) => ['set', id, 'nodes'] as const,
+  collections: (filters?: Record<string, unknown>) => ['collections', filters ?? {}] as const,
+  collection: (id: number) => ['collection', id] as const,
 }
 
 export interface CaseFilters extends Record<
@@ -55,11 +61,36 @@ export function useCase(id: number | undefined) {
 }
 
 export function useSets(
-  filters: { q?: string; tags?: string[]; trashed?: boolean; limit?: number } = {},
+  filters: {
+    q?: string
+    tags?: string[]
+    collection_id?: number
+    include_descendants?: boolean
+    visibility?: string[]
+    unfiled?: boolean
+    trashed?: boolean
+    limit?: number
+    offset?: number
+  } = {},
 ) {
   return useQuery({
     queryKey: qk.sets(filters),
     queryFn: () => apiFetchList<EvalSet>('/sets', { query: filters }),
+  })
+}
+
+export function useCollections(filters: { visibility?: string[]; roots_only?: boolean } = {}) {
+  return useQuery({
+    queryKey: qk.collections(filters),
+    queryFn: () => apiFetchList<EvalCollection>('/collections', { query: filters }),
+  })
+}
+
+export function useCollection(id: number | undefined) {
+  return useQuery({
+    queryKey: qk.collection(id ?? 0),
+    queryFn: () => apiFetch<EvalCollection>(`/collections/${id}`),
+    enabled: id !== undefined && Number.isFinite(id),
   })
 }
 
@@ -94,7 +125,15 @@ export function useSet(id: number | undefined) {
 
 export function useSetCases(
   id: number | undefined,
-  filters: { q?: string; tags?: string[]; limit?: number } = {},
+  filters: {
+    q?: string
+    tags?: string[]
+    node_id?: number
+    include_descendants?: boolean
+    ungrouped?: boolean
+    limit?: number
+    offset?: number
+  } = {},
   options?: Partial<UseQueryOptions<{ items: EvalCase[]; total: number }>>,
 ) {
   return useQuery({
@@ -113,6 +152,7 @@ function useInvalidateAll() {
     void client.invalidateQueries({ queryKey: ['case'] })
     void client.invalidateQueries({ queryKey: ['sets'] })
     void client.invalidateQueries({ queryKey: ['set'] })
+    void client.invalidateQueries({ queryKey: ['collections'] })
   }
 }
 
@@ -126,6 +166,7 @@ export interface CaseInput {
   tags?: string[]
   notes?: string | null
   set_id?: number
+  node_id?: number
 }
 
 export function useCreateCase() {
@@ -180,6 +221,7 @@ export type BulkOp =
       case_ids: number[]
       target_set_id: number
       source_set_id?: number
+      target_node_id?: number
       mode: 'copy' | 'move'
     }
   | { op: 'delete' | 'restore' | 'purge'; case_ids: number[] }
@@ -200,6 +242,46 @@ export interface SetInput {
   description?: string | null
   tags?: string[]
   default_scoring?: ScorerSpec[]
+  evaluation_profile?: EvaluationProfile
+  collection_id?: number | null
+  logical_key?: string | null
+  variant?: string | null
+  visibility?: 'primary' | 'fixture' | 'hidden'
+}
+
+export interface CollectionInput {
+  key: string
+  name: string
+  description?: string | null
+  parent_id?: number | null
+  position?: number
+  visibility?: 'primary' | 'fixture' | 'hidden'
+  tags?: string[]
+  provenance?: Record<string, unknown>
+}
+
+export function useCreateCollection() {
+  const client = useQueryClient()
+  return useMutation({
+    mutationFn: (body: CollectionInput) =>
+      apiFetch<EvalCollection>('/collections', { method: 'POST', body }),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: ['collections'] })
+    },
+  })
+}
+
+export function useUpdateCollection() {
+  const client = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, ...body }: Partial<CollectionInput> & { id: number }) =>
+      apiFetch<EvalCollection>(`/collections/${id}`, { method: 'PATCH', body }),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: ['collections'] })
+      void client.invalidateQueries({ queryKey: ['collection'] })
+      void client.invalidateQueries({ queryKey: ['sets'] })
+    },
+  })
 }
 
 export function useCreateSet() {
@@ -239,8 +321,69 @@ export function useRestoreSet() {
 export function useAttachCases(setId: number) {
   const invalidate = useInvalidateAll()
   return useMutation({
-    mutationFn: (case_ids: number[]) =>
-      apiFetch<CountResponse>(`/sets/${setId}/cases`, { method: 'POST', body: { case_ids } }),
+    mutationFn: ({ case_ids, node_id }: { case_ids: number[]; node_id?: number }) =>
+      apiFetch<CountResponse>(`/sets/${setId}/cases`, {
+        method: 'POST',
+        body: { case_ids, node_id },
+      }),
+    onSuccess: invalidate,
+  })
+}
+
+// -- set hierarchy ------------------------------------------------------------
+
+export function useSetNodes(setId: number | undefined) {
+  return useQuery({
+    queryKey: qk.setNodes(setId ?? 0),
+    queryFn: () => apiFetch<EvalSetNode[]>(`/sets/${setId}/nodes`),
+    enabled: setId !== undefined && Number.isFinite(setId),
+  })
+}
+
+export interface SetNodeInput {
+  name: string
+  parent_id?: number | null
+  description?: string | null
+  position?: number
+  tags?: string[]
+  provenance?: Record<string, unknown>
+}
+
+export function useCreateSetNode(setId: number) {
+  const invalidate = useInvalidateAll()
+  return useMutation({
+    mutationFn: (body: SetNodeInput) =>
+      apiFetch<EvalSetNode>(`/sets/${setId}/nodes`, { method: 'POST', body }),
+    onSuccess: invalidate,
+  })
+}
+
+export function useUpdateSetNode(setId: number) {
+  const invalidate = useInvalidateAll()
+  return useMutation({
+    mutationFn: ({ id, ...body }: Partial<SetNodeInput> & { id: number }) =>
+      apiFetch<EvalSetNode>(`/sets/${setId}/nodes/${id}`, { method: 'PATCH', body }),
+    onSuccess: invalidate,
+  })
+}
+
+export function useDeleteSetNode(setId: number) {
+  const invalidate = useInvalidateAll()
+  return useMutation({
+    mutationFn: (id: number) =>
+      apiFetch<CountResponse>(`/sets/${setId}/nodes/${id}`, { method: 'DELETE' }),
+    onSuccess: invalidate,
+  })
+}
+
+export function useAssignCasesNode(setId: number) {
+  const invalidate = useInvalidateAll()
+  return useMutation({
+    mutationFn: ({ case_ids, node_id }: { case_ids: number[]; node_id: number | null }) =>
+      apiFetch<CountResponse>(`/sets/${setId}/nodes/assign`, {
+        method: 'POST',
+        body: { case_ids, node_id },
+      }),
     onSuccess: invalidate,
   })
 }
@@ -278,6 +421,8 @@ export function useImportCases() {
       content: string
       format: ImportFormat
       set_id?: number
+      /** Destination branch. Native group_path values are nested below it. */
+      node_id?: number
       dry_run?: boolean
       /** Only meaningful for tabular formats; the server guesses without it. */
       mapping?: FieldMapping

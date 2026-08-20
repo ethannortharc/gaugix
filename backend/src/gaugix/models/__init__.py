@@ -6,7 +6,14 @@ Alembic's autogenerate and :func:`gaugix.db.create_all` depend on that.
 
 from gaugix.models.artifacts import Artifact
 from gaugix.models.base import TimestampMixin, dump_json, load_json, utcnow
-from gaugix.models.cases import AppSetting, EvalCase, EvalSet, SetMembership
+from gaugix.models.cases import (
+    AppSetting,
+    EvalCase,
+    EvalCollection,
+    EvalSet,
+    EvalSetNode,
+    SetMembership,
+)
 from gaugix.models.executors import (
     Executor,
     HarnessProfile,
@@ -21,7 +28,9 @@ __all__ = [
     "Artifact",
     "Attempt",
     "EvalCase",
+    "EvalCollection",
     "EvalSet",
+    "EvalSetNode",
     "Executor",
     "HarnessProfile",
     "ModelProfile",
