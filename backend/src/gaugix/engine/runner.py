@@ -20,7 +20,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import random
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -162,10 +162,10 @@ class Runner:
             return
 
         if self.cancel.is_set():
-            self._skip_unstarted()
+            self._skip_unstarted(item_ids)
             self._finalise(RunStatus.canceled)
         else:
-            self._finalise(RunStatus.completed)
+            self._finalise(self._completion_status())
 
     # -- per item ----------------------------------------------------------
 
@@ -216,6 +216,25 @@ class Runner:
                     if item is not None:
                         self._write_error_attempt(
                             session, item, attempt_n, exc.message, exc.kind, retries=exc.retries
+                        )
+                return
+            except Exception as exc:  # one adapter bug must not abort every sibling item
+                log.error(
+                    "unexpected_harness_error",
+                    run_id=self.run_id,
+                    item_id=item_id,
+                    error_type=type(exc).__name__,
+                )
+                with Session(self.engine) as session:
+                    item = session.get(RunItem, item_id)
+                    if item is not None:
+                        self._write_error_attempt(
+                            session,
+                            item,
+                            attempt_n,
+                            f"unexpected harness error: {type(exc).__name__}",
+                            "harness_error",
+                            retries=0,
                         )
                 return
 
@@ -418,12 +437,13 @@ class Runner:
         session.add(item)
         self._transition(session, item, ItemStatus.error)
 
-    def _skip_unstarted(self) -> None:
-        """Everything still pending when a cancel lands becomes `skipped` (PRD F3.4)."""
+    def _skip_unstarted(self, item_ids: list[int]) -> None:
+        """Mark only this invocation's unfinished items skipped on cancel."""
         with Session(self.engine) as session:
             rows = session.exec(
                 select(RunItem).where(
                     RunItem.run_id == self.run_id,
+                    col(RunItem.id).in_(item_ids),
                     col(RunItem.status).in_(
                         [str(ItemStatus.pending), str(ItemStatus.invoking), str(ItemStatus.scoring)]
                     ),
@@ -431,6 +451,24 @@ class Runner:
             ).all()
             for item in rows:
                 self._transition(session, item, ItemStatus.skipped)
+
+    def _completion_status(self) -> RunStatus:
+        """Keep a partial run resumable when an explicit retry leaves skipped work."""
+        with Session(self.engine) as session:
+            partial = session.exec(
+                select(RunItem.id).where(
+                    RunItem.run_id == self.run_id,
+                    col(RunItem.status).in_(
+                        [
+                            str(ItemStatus.pending),
+                            str(ItemStatus.invoking),
+                            str(ItemStatus.scoring),
+                            str(ItemStatus.skipped),
+                        ]
+                    ),
+                )
+            ).first()
+        return RunStatus.canceled if partial is not None else RunStatus.completed
 
     # -- run-level bookkeeping --------------------------------------------
 
@@ -693,21 +731,38 @@ def rerun_from(session: Session, run_id: int, item_id: int) -> list[int]:
 
 
 async def start_run(
-    engine: Engine, run_id: int, include_errors: bool = True, settings: Settings | None = None
+    engine: Engine,
+    run_id: int,
+    include_errors: bool = True,
+    settings: Settings | None = None,
+    *,
+    item_ids: Sequence[int] | None = None,
 ) -> RunnerHandle:
-    """Schedule a run in the background. Raises if one is already active."""
+    """Schedule a run, optionally restricting execution to explicit item ids."""
     if registry.is_active(run_id):
         raise RuntimeError(f"run {run_id} is already running")
 
-    with Session(engine) as session:
-        item_ids = schedulable_item_ids(session, run_id, include_errors)
+    if item_ids is None:
+        with Session(engine) as session:
+            scheduled_ids = schedulable_item_ids(session, run_id, include_errors)
+    else:
+        scheduled_ids = list(dict.fromkeys(item_ids))
+        with Session(engine) as session:
+            existing = session.exec(
+                select(RunItem.id).where(
+                    RunItem.run_id == run_id,
+                    col(RunItem.id).in_(scheduled_ids),
+                )
+            ).all()
+        if set(existing) != set(scheduled_ids):
+            raise ValueError("explicit run items must all belong to the requested run")
 
     cancel_event = asyncio.Event()
     runner = Runner(engine, run_id, cancel_event, settings)
 
     async def _drive() -> None:
         try:
-            await runner.execute(item_ids)
+            await runner.execute(scheduled_ids)
         finally:
             registry.discard(run_id)
 
@@ -726,8 +781,9 @@ async def cancel_run(engine: Engine, run_id: int) -> bool:
             run = session.get(Run, run_id)
             if run is None or run.is_terminal:
                 return False
+            item_ids = schedulable_item_ids(session, run_id)
         runner = Runner(engine, run_id, asyncio.Event())
-        runner._skip_unstarted()
+        runner._skip_unstarted(item_ids)
         runner._finalise(RunStatus.canceled)
         return True
 

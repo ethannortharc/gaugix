@@ -19,13 +19,13 @@ to run on every keystroke of the builder.
 
 from __future__ import annotations
 
-import os
 import re
 from dataclasses import dataclass, field
 
 import jsonschema
 from sqlmodel import Session, col, select
 
+from gaugix.config import credential_environment
 from gaugix.domain import HarnessKind, Pricing, Provider, ScorerSpec, ScorerType
 from gaugix.engine.planner import resolve_scoring
 from gaugix.models.cases import EvalCase, EvalSet, SetMembership
@@ -227,8 +227,11 @@ def _check_subset(
 
 def _check_credentials(result: Preflight, executors: list[_ExecutorInfo]) -> None:
     """A missing key fails every item in the lane, one call at a time."""
+    environment = credential_environment()
     missing = [
-        e for e in executors if e.model.api_key_env and not os.environ.get(e.model.api_key_env)
+        e
+        for e in executors
+        if e.model.api_key_env and not environment.get(e.model.api_key_env, "").strip()
     ]
     for info in missing:
         result.findings.append(

@@ -132,6 +132,7 @@ async def score_item(
     judge_executor: ExecutorSnapshot | None = None,
     only_indices: list[int] | None = None,
     use_frozen_judges: bool = True,
+    finalize_status: bool = False,
 ) -> Aggregate:
     """Run every auto/judge scorer for an item and persist the results."""
     case: CaseSnapshot = item.case_snapshot
@@ -204,7 +205,7 @@ async def score_item(
         scored.append(ScoredScorer(index=index, spec=spec, result=result, source=source))
 
     outcome = aggregate(scored)
-    _apply(session, item, outcome)
+    _apply(session, item, outcome, finalize_status=finalize_status)
 
     # Judge usage is *not* added incrementally here: it is stored in each Score's
     # judge_meta and folded in by recompute_totals, so a re-score cannot double-count
@@ -389,12 +390,26 @@ def _append_score(
     return score
 
 
-def _apply(session: Session, item: RunItem, outcome: Aggregate) -> None:
-    """Write the aggregate back onto the item and set its terminal status."""
+def _apply(
+    session: Session,
+    item: RunItem,
+    outcome: Aggregate,
+    *,
+    finalize_status: bool = False,
+) -> None:
+    """Write the aggregate and update already-terminal items after a re-score.
+
+    A live runner owns the ``scoring -> passed/failed`` transition because that
+    transition also maintains the run's incremental counters and emits the UI
+    event.  Moving an in-flight item here made the runner observe
+    ``passed -> passed`` and left the live totals stuck in ``scoring`` until the
+    final full recomputation.
+    """
     item.verdict = outcome.verdict
     item.score_value = outcome.score_value
     item.needs_human = outcome.needs_human
-    if item.status in {str(ItemStatus.passed), str(ItemStatus.failed), str(ItemStatus.scoring)}:
+    terminal = {str(ItemStatus.passed), str(ItemStatus.failed)}
+    if item.status in terminal or (finalize_status and item.status == str(ItemStatus.scoring)):
         item.status = str(ItemStatus.failed if outcome.verdict is False else ItemStatus.passed)
     item.touch()
     session.add(item)
@@ -480,12 +495,12 @@ def submit_human_score(
         created_by="human",
     )
 
-    outcome = recompute_item(session, item)
+    outcome = recompute_item(session, item, finalize_status=True)
     session.commit()
     return outcome, disagreed
 
 
-def recompute_item(session: Session, item: RunItem) -> Aggregate:
+def recompute_item(session: Session, item: RunItem, *, finalize_status: bool = False) -> Aggregate:
     """Re-aggregate an item from its stored latest scores. No model calls."""
     case = item.case_snapshot
     stored = latest_scores(session, item.id or 0)
@@ -499,5 +514,5 @@ def recompute_item(session: Session, item: RunItem) -> Aggregate:
         for index, spec in enumerate(case.scoring)
     ]
     outcome = aggregate(scored)
-    _apply(session, item, outcome)
+    _apply(session, item, outcome, finalize_status=finalize_status)
     return outcome

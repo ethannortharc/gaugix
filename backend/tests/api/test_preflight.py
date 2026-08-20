@@ -55,7 +55,13 @@ async def test_a_healthy_run_passes_with_nothing_to_say(client):
 
 
 async def make_direct_stack(
-    client, name, *, adapter=None, capture=False, provider="openai_compatible"
+    client,
+    name,
+    *,
+    adapter=None,
+    capture=False,
+    provider="openai_compatible",
+    api_key_env=None,
 ):
     model = await client.post(
         "/api/v1/model-profiles",
@@ -63,6 +69,7 @@ async def make_direct_stack(
             "name": f"{name}-model",
             "provider": provider,
             "model_id": "subject",
+            "api_key_env": api_key_env,
             **({"base_url": "http://gateway.test/v1"} if provider == "openai_compatible" else {}),
         },
     )
@@ -88,6 +95,46 @@ async def make_direct_stack(
     )
     assert executor.status_code == 201, executor.text
     return executor.json()
+
+
+async def test_preflight_uses_the_same_frozen_credential_view_as_execution(client, monkeypatch):
+    from gaugix.config import credential_environment, reset_settings_cache
+
+    monkeypatch.setenv("GAUGIX_FREEZE_CREDENTIALS", "1")
+    monkeypatch.setenv("PREFLIGHT_TEST_KEY", "frozen-value")
+    reset_settings_cache()
+    try:
+        credential_environment()
+        monkeypatch.delenv("PREFLIGHT_TEST_KEY")
+
+        eval_set = await make_set(client, name="Frozen credential")
+        await make_case(client, eval_set["id"], scoring=CONTAINS)
+        executor = await make_direct_stack(
+            client,
+            "frozen-credential",
+            api_key_env="PREFLIGHT_TEST_KEY",
+        )
+
+        body = await run_preflight(client, [eval_set["id"]], [executor["id"]])
+
+        assert "missing_api_key" not in codes(body)
+    finally:
+        reset_settings_cache()
+
+
+async def test_preflight_rejects_a_whitespace_only_credential(client, monkeypatch):
+    monkeypatch.setenv("PREFLIGHT_WHITESPACE_KEY", "   ")
+    eval_set = await make_set(client, name="Whitespace credential")
+    await make_case(client, eval_set["id"], scoring=CONTAINS)
+    executor = await make_direct_stack(
+        client,
+        "whitespace-credential",
+        api_key_env="PREFLIGHT_WHITESPACE_KEY",
+    )
+
+    body = await run_preflight(client, [eval_set["id"]], [executor["id"]])
+
+    assert "missing_api_key" in codes(body)
 
 
 VERDICT_SCORER = [
@@ -693,6 +740,7 @@ async def test_creating_a_code_executing_run_needs_an_explicit_acknowledgement(c
     assert refused.status_code == 422
     assert "model-written code" in refused.json()["error"]["message"]
     assert accepted.status_code == 201
+    assert accepted.json()["config"]["accepted_code_execution"] is True
 
 
 # -- the API enforces what the builder shows -----------------------------------

@@ -9,7 +9,9 @@ from fastapi import APIRouter, Depends, Query, Response
 from pydantic import BaseModel, ConfigDict, Field
 from sqlmodel import Session, col, select
 
+from gaugix.config import redact_for_display
 from gaugix.db import get_session
+from gaugix.domain import RunStatus
 from gaugix.errors import NotFoundError, ValidationError
 from gaugix.models.runs import Run, RunItem
 from gaugix.models.scores import Score
@@ -104,9 +106,9 @@ def to_score_read(score: Score) -> ScoreRead:
         scorer_config_hash=score.scorer_config_hash,
         passed=score.passed,
         value=score.value,
-        rationale=score.rationale,
+        rationale=redact_for_display(score.rationale),
         source=score.source,
-        judge_meta=score.judge_meta,
+        judge_meta=redact_for_display(score.judge_meta),
         version=score.version,
         created_at=score.created_at,
     )
@@ -141,6 +143,7 @@ def post_human_score(
 ) -> HumanScoreResponse:
     """Record your judgement. It overrides the machine for that scorer (PRD F4.4)."""
     item = get_or_404(session, RunItem, item_id, "Item")
+    _ensure_runs_idle(session, {item.run_id})
     if payload.passed is None and payload.value is None:
         raise ValidationError("provide `passed` and/or `value`")
 
@@ -242,6 +245,14 @@ async def rescore(payload: RescoreRequest, session: SessionDep) -> RescoreRespon
             session, payload.run_id, only_failing=payload.only_failing
         )
 
+    selected_run_ids = {
+        item.run_id
+        for item in session.exec(select(RunItem).where(col(RunItem.id).in_(item_ids))).all()
+    }
+    if payload.run_id is not None:
+        selected_run_ids.add(payload.run_id)
+    _ensure_runs_idle(session, selected_run_ids)
+
     report = await rescore_module.rescore_items(
         session,
         item_ids,
@@ -268,6 +279,24 @@ async def rescore(payload: RescoreRequest, session: SessionDep) -> RescoreRespon
         configs_refreshed=report.configs_refreshed,
         details=report.details,
     )
+
+
+def _ensure_runs_idle(session: Session, run_ids: set[int]) -> None:
+    """Keep live-run state transitions exclusively owned by the runner."""
+    if not run_ids:
+        return
+    from gaugix.engine.runner import registry
+
+    active = [
+        run.id or 0
+        for run in session.exec(select(Run).where(col(Run.id).in_(run_ids))).all()
+        if run.status == str(RunStatus.running) or registry.is_active(run.id or 0)
+    ]
+    if active:
+        joined = ", ".join(str(run_id) for run_id in sorted(active))
+        raise ValidationError(
+            f"cannot score run(s) {joined} while execution is active; wait for completion"
+        )
 
 
 @router.get("/rubrics", response_model=list[RubricRead])

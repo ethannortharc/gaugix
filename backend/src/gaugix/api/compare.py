@@ -20,6 +20,7 @@ from gaugix.compare import (
     leaderboard,
     matrix,
 )
+from gaugix.config import redact_for_display
 from gaugix.db import get_session
 from gaugix.errors import NotFoundError, ValidationError
 from gaugix.models.cases import EvalSet
@@ -50,7 +51,7 @@ ExecutorKeys = Annotated[list[str] | None, Query(alias="executor")]
 def _require_runs(session: Session, run_ids: list[int]) -> None:
     if not run_ids:
         raise ValidationError("pick at least one run to compare")
-    found = {run.id for run in session.exec(select(Run)).all()}
+    found = set(session.exec(select(Run.id).where(col(Run.id).in_(run_ids))).all())
     missing = [run_id for run_id in run_ids if run_id not in found]
     if missing:
         raise NotFoundError(f"no run with id {missing[0]}")
@@ -156,7 +157,7 @@ def get_diff(
         c.model_dump() for c in _coverage(session, requested_sets, resolved, included=scoped_sets)
     ]
     payload["scoped_set_ids"] = scoped_sets
-    return DiffRead.model_validate(payload)
+    return DiffRead.model_validate(redact_for_display(payload))
 
 
 def _set_ids_for(session: Session, run_id: int) -> list[int]:
@@ -230,7 +231,7 @@ def get_matrix(
     run_ids = run_id or []
     _require_runs(session, run_ids)
     return MatrixRead.model_validate(
-        matrix(session, run_ids, set_ids=set_id, executor_keys=executor)
+        redact_for_display(matrix(session, run_ids, set_ids=set_id, executor_keys=executor))
     )
 
 

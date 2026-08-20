@@ -4,14 +4,21 @@ from __future__ import annotations
 
 import asyncio
 
+from sqlmodel import select
+
 from tests.api.test_cases import make_case, make_set
 
 
-async def make_fake_stack(client, name="fake", harness_config=None):
+async def make_fake_stack(client, name="fake", harness_config=None, model_params=None):
     """Create a fake model + harness + executor via the public API."""
     model = await client.post(
         "/api/v1/model-profiles",
-        json={"name": f"{name}-model", "provider": "fake", "model_id": name},
+        json={
+            "name": f"{name}-model",
+            "provider": "fake",
+            "model_id": name,
+            "params": model_params or {},
+        },
     )
     assert model.status_code == 201, model.text
     harness = await client.post(
@@ -302,6 +309,33 @@ async def test_run_executes_to_completion(client):
     assert run["totals"]["passed"] == 3
 
 
+async def test_run_list_set_filter_uses_membership_not_json_id_prefixes(client):
+    stack = await make_fake_stack(client, "set-filter")
+    eval_sets = [await make_set(client, name=f"Filter set {i}") for i in range(10)]
+    first, tenth = eval_sets[0], eval_sets[9]
+    await make_case(client, title="First", set_id=first["id"])
+    await make_case(client, title="Tenth", set_id=tenth["id"])
+    first_run = (
+        await client.post(
+            "/api/v1/runs",
+            json={"set_ids": [first["id"]], "executor_ids": [stack["executor"]["id"]]},
+        )
+    ).json()
+    tenth_run = (
+        await client.post(
+            "/api/v1/runs",
+            json={"set_ids": [tenth["id"]], "executor_ids": [stack["executor"]["id"]]},
+        )
+    ).json()
+    await wait_for_run(client, first_run["id"])
+    await wait_for_run(client, tenth_run["id"])
+
+    response = await client.get("/api/v1/runs", params={"set_id": first["id"]})
+
+    assert response.headers["X-Total-Count"] == "1"
+    assert [row["id"] for row in response.json()] == [first_run["id"]]
+
+
 async def test_run_can_be_planned_without_starting(client):
     stack = await make_fake_stack(client)
     eval_set = await seeded_set(client, n=2)
@@ -466,6 +500,202 @@ async def test_item_drill_down_shows_input_output_and_attempts(client):
     assert attempt["output_text"]
     assert attempt["prompt_tokens"] > 0
     assert attempt["cost_usd"] == 0.0
+    assert attempt["request"]["harness"] == "fake"
+    assert detail["executor_snapshot"]["key"] == stack["executor"]["name"]
+    assert detail["executor_snapshot"]["model"]["model_id"] == "fake"
+
+
+async def test_run_and_item_errors_are_redacted_at_the_api_boundary(client, session):
+    from gaugix.models import Run, RunItem
+
+    stack = await make_fake_stack(client)
+    eval_set = await seeded_set(client, n=1)
+    run = (
+        await client.post(
+            "/api/v1/runs",
+            json={"set_ids": [eval_set["id"]], "executor_ids": [stack["executor"]["id"]]},
+        )
+    ).json()
+    await wait_for_run(client, run["id"])
+
+    stored_run = session.get(Run, run["id"])
+    assert stored_run is not None
+    stored_run.error = 'upstream {"Authorization":"Bearer should-not-escape"}'
+    stored_run.config = {
+        **stored_run.config,
+        "debug": {"api_key": "opaque-run-config-secret"},
+    }
+    item = session.exec(select(RunItem).where(RunItem.run_id == run["id"])).one()
+    item.error = 'provider {"api_key":"should-not-escape"}'
+    session.add(stored_run)
+    session.add(item)
+    session.commit()
+
+    run_body = (await client.get(f"/api/v1/runs/{run['id']}")).json()
+    item_body = (await client.get(f"/api/v1/runs/{run['id']}/items")).json()[0]
+    assert "should-not-escape" not in run_body["error"]
+    assert "should-not-escape" not in item_body["error"]
+    assert "opaque-run-config-secret" not in str(run_body["config"])
+    assert "[REDACTED]" in run_body["error"]
+    assert "[REDACTED]" in item_body["error"]
+    assert run_body["config"]["debug"]["api_key"] == "[REDACTED]"
+
+
+async def test_attempt_details_are_redacted_at_the_api_boundary(client, session):
+    from gaugix.models import Attempt, RunItem
+
+    stack = await make_fake_stack(client)
+    eval_set = await seeded_set(client, n=1)
+    run = (
+        await client.post(
+            "/api/v1/runs",
+            json={"set_ids": [eval_set["id"]], "executor_ids": [stack["executor"]["id"]]},
+        )
+    ).json()
+    await wait_for_run(client, run["id"])
+
+    item = session.exec(select(RunItem).where(RunItem.run_id == run["id"])).one()
+    attempt = session.get(Attempt, item.current_attempt_id)
+    assert attempt is not None
+    attempt.request = {"headers": {"Authorization": "Bearer request-secret"}}
+    attempt.output_text = "api_key=output-secret"
+    attempt.messages = [{"role": "assistant", "content": "token: message-secret"}]
+    attempt.error = "credentials: error-secret"
+    session.add(attempt)
+    session.commit()
+
+    detail = (await client.get(f"/api/v1/items/{item.id}")).json()
+    rendered = str(detail["attempts"][0])
+    for secret in ("request-secret", "output-secret", "message-secret", "error-secret"):
+        assert secret not in rendered
+    assert "[REDACTED]" in rendered
+
+
+def test_safe_case_snapshot_degrades_without_exposing_the_original(monkeypatch):
+    from gaugix.api import runs as runs_api
+    from gaugix.config import redact_for_display
+    from gaugix.domain import CaseSnapshot, Message, Role
+
+    snapshot = CaseSnapshot(
+        title="api_key=title-secret",
+        input=[Message(role=Role.user, content="token: content-secret")],
+        reference="password: reference-secret",
+        notes="credentials: notes-secret",
+    )
+
+    def malformed_on_mapping(value):
+        if isinstance(value, dict):
+            return []
+        return redact_for_display(value)
+
+    monkeypatch.setattr(runs_api, "redact_for_display", malformed_on_mapping)
+    safe = runs_api._safe_case_snapshot(snapshot)
+
+    rendered = safe.model_dump_json()
+    for secret in ("title-secret", "content-secret", "reference-secret", "notes-secret"):
+        assert secret not in rendered
+    assert "[REDACTED]" in rendered
+
+
+async def test_score_rationales_are_redacted_in_run_and_item_views(client, session):
+    from gaugix.models.scores import Score
+
+    stack = await make_fake_stack(client)
+    eval_set = await make_set(client, name="Rationale redaction")
+    await make_case(
+        client,
+        title="Must fail",
+        set_id=eval_set["id"],
+        scoring=[
+            {
+                "type": "contains",
+                "params": {"text": "not-in-output"},
+                "required": True,
+                "weight": 1,
+            }
+        ],
+    )
+    run = (
+        await client.post(
+            "/api/v1/runs",
+            json={"set_ids": [eval_set["id"]], "executor_ids": [stack["executor"]["id"]]},
+        )
+    ).json()
+    await wait_for_run(client, run["id"])
+    item = (await client.get(f"/api/v1/runs/{run['id']}/items")).json()[0]
+    score = session.exec(select(Score).where(Score.run_item_id == item["id"])).one()
+    secret = "sk-derived-rationale-secret-123456"
+    score.rationale = f"judge quoted {secret}"
+    score.judge_meta = {"debug": {"authorization": f"Bearer {secret}"}}
+    session.add(score)
+    session.commit()
+
+    board_item = (await client.get(f"/api/v1/runs/{run['id']}/items")).json()[0]
+    detail = (await client.get(f"/api/v1/items/{item['id']}")).json()
+
+    assert secret not in board_item["score_summary"]
+    assert "[REDACTED]" in board_item["score_summary"]
+    assert secret not in detail["scores"][0]["rationale"]
+    assert secret not in str(detail["scores"][0]["judge_meta"])
+
+
+async def test_item_detail_redacts_frozen_case_fields(client):
+    secret = "sk-frozen-case-secret-123456"
+    eval_set = await make_set(client, name="Frozen case redaction")
+    await make_case(
+        client,
+        title=f"Review {secret}",
+        set_id=eval_set["id"],
+        input=[{"role": "user", "content": f'authorization: "Bearer {secret}"'}],
+        reference="api_key=opaque-reference-value",
+        notes="token=opaque-note-value",
+    )
+    stack = await make_fake_stack(client)
+    run = (
+        await client.post(
+            "/api/v1/runs",
+            json={"set_ids": [eval_set["id"]], "executor_ids": [stack["executor"]["id"]]},
+        )
+    ).json()
+    await wait_for_run(client, run["id"])
+    board_item = (await client.get(f"/api/v1/runs/{run['id']}/items")).json()[0]
+    detail = (await client.get(f"/api/v1/items/{board_item['id']}")).json()
+
+    rendered = str(detail)
+    assert secret not in board_item["title"]
+    assert secret not in rendered
+    assert "opaque-reference-value" not in rendered
+    assert "opaque-note-value" not in rendered
+    assert "[REDACTED]" in rendered
+
+
+async def test_run_item_board_explains_a_scorer_failure(client):
+    stack = await make_fake_stack(client)
+    eval_set = await make_set(client, name="Explained failure")
+    await make_case(
+        client,
+        title="Missing contract",
+        set_id=eval_set["id"],
+        scoring=[
+            {
+                "type": "contains",
+                "params": {"text": "definitely-not-in-the-echo"},
+                "required": True,
+                "weight": 1,
+            }
+        ],
+    )
+    run = (
+        await client.post(
+            "/api/v1/runs",
+            json={"set_ids": [eval_set["id"]], "executor_ids": [stack["executor"]["id"]]},
+        )
+    ).json()
+    await wait_for_run(client, run["id"])
+
+    item = (await client.get(f"/api/v1/runs/{run['id']}/items")).json()[0]
+    assert item["status"] == "failed"
+    assert "definitely-not-in-the-echo" in item["score_summary"]
 
 
 async def test_unknown_item_is_404(client):
@@ -744,6 +974,51 @@ async def test_retrying_one_item_leaves_the_rest_of_the_lane_alone(client):
     for other in items[1:]:
         other_detail = (await client.get(f"/api/v1/items/{other['id']}")).json()
         assert len(other_detail["attempts"]) == 1
+
+
+async def test_retrying_one_item_does_not_resume_other_errors_or_skips(client, session):
+    """A canceled diagnostic run may have hundreds of errors and skipped rows."""
+    from gaugix.domain import ItemStatus
+    from gaugix.models.runs import RunItem
+
+    eval_set = await make_set(client, name="Mixed retry states")
+    for i in range(3):
+        await make_case(client, title=f"Mixed {i}", set_id=eval_set["id"])
+    stack = await make_fake_stack(client, "mixed-retry")
+    run = await wait_for_run(
+        client,
+        (
+            await client.post(
+                "/api/v1/runs",
+                json={"set_ids": [eval_set["id"]], "executor_ids": [stack["executor"]["id"]]},
+            )
+        ).json()["id"],
+    )
+    items = (await client.get(f"/api/v1/runs/{run['id']}/items")).json()
+    target, unrelated_error, unrelated_skip = items
+    for item_id, status in (
+        (unrelated_error["id"], ItemStatus.error),
+        (unrelated_skip["id"], ItemStatus.skipped),
+    ):
+        row = session.get(RunItem, item_id)
+        assert row is not None
+        row.status = str(status)
+        session.add(row)
+    session.commit()
+
+    response = await client.post(f"/api/v1/runs/{run['id']}/items/{target['id']}/retry")
+    assert response.status_code == 200, response.text
+    finished = await wait_for_run(client, run["id"])
+
+    target_detail = (await client.get(f"/api/v1/items/{target['id']}")).json()
+    error_detail = (await client.get(f"/api/v1/items/{unrelated_error['id']}")).json()
+    skip_detail = (await client.get(f"/api/v1/items/{unrelated_skip['id']}")).json()
+    assert len(target_detail["attempts"]) == 2
+    assert len(error_detail["attempts"]) == 1
+    assert len(skip_detail["attempts"]) == 1
+    assert error_detail["status"] == "error"
+    assert skip_detail["status"] == "skipped"
+    assert finished["status"] == "canceled"
 
 
 async def test_retrying_an_item_from_another_run_is_a_404(client):

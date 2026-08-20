@@ -9,6 +9,7 @@ from dataclasses import asdict
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Query, Request, Response
+from pydantic import ValidationError as PydanticValidationError
 from sqlmodel import Session, col, func, select
 from sse_starlette.sse import EventSourceResponse
 
@@ -16,8 +17,9 @@ from gaugix import coverage
 from gaugix.api.artifacts import to_read as artifact_read
 from gaugix.artifacts import store as artifact_store
 from gaugix.compare import set_trends
+from gaugix.config import redact_for_display
 from gaugix.db import get_engine, get_session
-from gaugix.domain import ItemStatus, Pricing, RunStatus
+from gaugix.domain import CaseSnapshot, ItemStatus, Pricing, RunStatus
 from gaugix.engine import planner
 from gaugix.engine.events import bus
 from gaugix.engine.preflight import Preflight, preflight
@@ -32,6 +34,7 @@ from gaugix.engine.runner import (
 )
 from gaugix.errors import ConflictError, NotFoundError, ValidationError
 from gaugix.models.runs import Attempt, Run, RunItem
+from gaugix.models.scores import Score
 from gaugix.repo import get_or_404
 from gaugix.schemas.runs import (
     AttemptRead,
@@ -43,6 +46,7 @@ from gaugix.schemas.runs import (
     PreflightFinding,
     PreflightRead,
     RerunFromResponse,
+    RerunRequest,
     ResumeRequest,
     ResumeResponse,
     RunCreate,
@@ -112,10 +116,10 @@ def to_run_read(run: Run, *, resumable_items: int) -> RunRead:
         name=run.name,
         status=run.status,
         parent_run_id=run.parent_run_id,
-        config=run.config,
+        config=redact_for_display(run.config),
         totals=run.totals,
         is_baseline_for=run.is_baseline_for,
-        error=run.error,
+        error=redact_for_display(run.error),
         started_at=run.started_at,
         finished_at=run.finished_at,
         created_at=run.created_at,
@@ -136,7 +140,7 @@ def _one(session: Session, run: Run) -> RunRead:
     return to_run_read(run, resumable_items=counts.get(run.id or 0, 0))
 
 
-def to_item_read(item: RunItem) -> RunItemRead:
+def to_item_read(item: RunItem, *, score_summary: str | None = None) -> RunItemRead:
     return RunItemRead(
         id=item.id or 0,
         run_id=item.run_id,
@@ -145,12 +149,13 @@ def to_item_read(item: RunItem) -> RunItemRead:
         case_id=item.case_id,
         executor_key=item.executor_key,
         position=item.position,
-        title=item.title,
+        title=redact_for_display(item.title),
         status=item.status,
         verdict=item.verdict,
         score_value=item.score_value,
         needs_human=item.needs_human,
-        error=item.error,
+        error=redact_for_display(item.error),
+        score_summary=score_summary,
         updated_at=item.updated_at,
     )
 
@@ -160,17 +165,50 @@ def to_attempt_read(attempt: Attempt) -> AttemptRead:
         id=attempt.id or 0,
         n=attempt.n,
         status=attempt.status,
-        output_text=attempt.output_text,
-        messages=attempt.messages,
+        request=redact_for_display(attempt.request or {}),
+        output_text=redact_for_display(attempt.output_text),
+        messages=redact_for_display(attempt.messages or []),
         prompt_tokens=attempt.prompt_tokens,
         completion_tokens=attempt.completion_tokens,
         cost_usd=attempt.cost_usd,
         latency_ms=attempt.latency_ms,
-        error=attempt.error,
+        error=redact_for_display(attempt.error),
         error_kind=attempt.error_kind,
         retries=attempt.retries,
         superseded=attempt.superseded,
         created_at=attempt.created_at,
+    )
+
+
+def _safe_case_snapshot(snapshot: CaseSnapshot) -> CaseSnapshot:
+    """Redact a frozen case without letting malformed legacy data break drill-down."""
+    safe = redact_for_display(snapshot.model_dump(mode="json"))
+    if isinstance(safe, dict):
+        try:
+            return CaseSnapshot.model_validate(safe)
+        except PydanticValidationError:
+            pass
+
+    def safe_text(value: str | None) -> str | None:
+        if value is None:
+            return None
+        redacted = redact_for_display(value)
+        return redacted if isinstance(redacted, str) else "[REDACTED]"
+
+    return snapshot.model_copy(
+        update={
+            "title": safe_text(snapshot.title) or "[REDACTED]",
+            "input": [
+                message.model_copy(update={"content": safe_text(message.content) or "[REDACTED]"})
+                for message in snapshot.input
+            ],
+            "reference": safe_text(snapshot.reference),
+            # Scorer params are arbitrary provider data and are the likeliest
+            # legacy shape to become invalid after recursive redaction.
+            "scoring": [],
+            "tags": [safe_text(tag) or "[REDACTED]" for tag in snapshot.tags],
+            "notes": safe_text(snapshot.notes),
+        }
     )
 
 
@@ -304,6 +342,9 @@ async def create_run(payload: RunCreate, session: SessionDep) -> RunRead:
             auto_score=payload.auto_score,
             parent_run_id=payload.parent_run_id,
             case_ids=payload.case_ids,
+            accepted_code_execution=(
+                checks.requires_code_execution and payload.accept_code_execution
+            ),
         ),
     )
     run_id = planned.run.id or 0
@@ -333,9 +374,11 @@ def list_runs(
     if status:
         statement = statement.where(col(Run.status).in_(status))
     if set_id is not None:
-        statement = statement.where(col(Run.config_json).contains(f'"id": {set_id}'))
+        statement = statement.where(
+            col(Run.id).in_(select(RunItem.run_id).where(RunItem.set_id == set_id))
+        )
 
-    total = len(session.exec(statement).all())
+    total = session.exec(select(func.count()).select_from(statement.subquery())).one()
     rows = session.exec(statement.order_by(col(Run.id).desc()).limit(limit).offset(offset)).all()
     response.headers["X-Total-Count"] = str(total)
     counts = _resumable_counts(session, [r.id for r in rows if r.id is not None])
@@ -434,14 +477,15 @@ def list_run_items(
             )
         )
 
-    total = len(session.exec(statement).all())
+    total = session.exec(select(func.count()).select_from(statement.subquery())).one()
     rows = session.exec(
         statement.order_by(col(RunItem.executor_key), col(RunItem.position))
         .limit(limit)
         .offset(offset)
     ).all()
     response.headers["X-Total-Count"] = str(total)
-    return [to_item_read(i) for i in rows]
+    summaries = _score_summaries(session, [row.id or 0 for row in rows])
+    return [to_item_read(i, score_summary=summaries.get(i.id or 0)) for i in rows]
 
 
 @router.get("/items/{item_id}", response_model=RunItemDetail)
@@ -449,6 +493,7 @@ def get_item(item_id: int, session: SessionDep) -> RunItemDetail:
     """Full drill-down: input, every attempt, every score, artifacts."""
     item = get_or_404(session, RunItem, item_id, "Item")
     snapshot = item.case_snapshot
+    safe_case_snapshot = _safe_case_snapshot(snapshot)
 
     attempts = session.exec(
         select(Attempt).where(Attempt.run_item_id == item_id).order_by(col(Attempt.n))
@@ -456,12 +501,27 @@ def get_item(item_id: int, session: SessionDep) -> RunItemDetail:
     attempt_ids = [a.id for a in attempts if a.id is not None]
     run = session.get(Run, item.run_id)
     neighbours = _lane_neighbours(session, item)
+    executor_snapshot = None
+    if run is not None:
+        executor_snapshot = next(
+            (
+                redact_for_display(snapshot.model_dump(mode="json"))
+                for snapshot in run.executors
+                if snapshot.key == item.executor_key
+            ),
+            None,
+        )
 
+    item_read = to_item_read(
+        item,
+        score_summary=_score_summaries(session, [item_id]).get(item_id),
+    )
     return RunItemDetail(
-        **to_item_read(item).model_dump(),
-        input=snapshot.input,
-        reference=snapshot.reference,
-        case_snapshot=snapshot,
+        **item_read.model_dump(),
+        input=safe_case_snapshot.input,
+        reference=safe_case_snapshot.reference,
+        case_snapshot=safe_case_snapshot,
+        executor_snapshot=executor_snapshot,
         attempts=[to_attempt_read(a) for a in attempts],
         scores=_load_scores(session, item_id),
         artifacts=[
@@ -471,6 +531,41 @@ def get_item(item_id: int, session: SessionDep) -> RunItemDetail:
         run_name=run.name if run else "",
         **neighbours,
     )
+
+
+def _score_summaries(session: Session, item_ids: list[int]) -> dict[int, str]:
+    """Return one actionable explanation per item without an N+1 query.
+
+    Only the latest version of each scorer counts. Failed/error rationales are
+    preferred; for a successful item, the latest-version rationale from each
+    scorer is useful when the run board is being audited rather than debugged.
+    """
+    if not item_ids:
+        return {}
+    rows = session.exec(
+        select(Score)
+        .where(col(Score.run_item_id).in_(item_ids))
+        .order_by(col(Score.run_item_id), col(Score.scorer_index), col(Score.version))
+    ).all()
+    latest: dict[tuple[int, int], Score] = {}
+    for score in rows:
+        latest[(score.run_item_id, score.scorer_index)] = score
+    grouped: dict[int, list[Score]] = {}
+    for score in latest.values():
+        grouped.setdefault(score.run_item_id, []).append(score)
+    summaries: dict[int, str] = {}
+    for item_id, scores in grouped.items():
+        ordered = sorted(scores, key=lambda score: score.scorer_index)
+        interesting = [score for score in ordered if score.passed is not True] or ordered
+        parts = [
+            safe
+            for score in interesting
+            if (text := (score.rationale or "").strip())
+            and isinstance((safe := redact_for_display(text)), str)
+        ]
+        if parts:
+            summaries[item_id] = " · ".join(parts)
+    return summaries
 
 
 def _lane_neighbours(session: Session, item: RunItem) -> dict[str, Any]:
@@ -634,7 +729,7 @@ async def retry_one_item(run_id: int, item_id: int, session: SessionDep) -> Reru
     except ValueError as exc:
         raise NotFoundError(str(exc)) from exc
 
-    await start_run(get_engine(), run_id)
+    await start_run(get_engine(), run_id, item_ids=[item_id])
     return RerunFromResponse(ok=True, affected=1, status=str(RunStatus.running))
 
 
@@ -655,12 +750,14 @@ async def rerun_from_item(run_id: int, item_id: int, session: SessionDep) -> Rer
             ok=False, affected=0, status="unchanged", message="nothing to rerun"
         )
 
-    await start_run(get_engine(), run_id)
+    await start_run(get_engine(), run_id, item_ids=reset)
     return RerunFromResponse(ok=True, affected=len(reset), status=str(RunStatus.running))
 
 
 @router.post("/runs/{run_id}/rerun", response_model=RunRead, status_code=201)
-async def rerun_whole_run(run_id: int, session: SessionDep) -> RunRead:
+async def rerun_whole_run(
+    run_id: int, session: SessionDep, payload: RerunRequest | None = None
+) -> RunRead:
     """Start a fresh run with the same sets and executors, linked as a child (PRD F3.7)."""
     parent = get_or_404(session, Run, run_id, "Run")
     config = parent.config
@@ -685,9 +782,13 @@ async def rerun_whole_run(run_id: int, session: SessionDep) -> RunRead:
             # A partial run reruns the same part. Rerunning the whole set instead
             # would silently change what the two runs compare.
             case_ids=config.get("case_ids"),
-            # The parent already carried this acknowledgement; a rerun of an
-            # accepted run must not stall on re-accepting it.
-            accept_code_execution=True,
+            # Only a parent that actually required and recorded this explicit
+            # acknowledgement may carry it forward. If the set gained a Python
+            # scorer later, create_run must stop and ask for fresh consent.
+            accept_code_execution=(
+                bool(config.get("accepted_code_execution", False))
+                or bool(payload and payload.accept_code_execution)
+            ),
         ),
         session,
     )

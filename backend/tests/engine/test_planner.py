@@ -238,6 +238,76 @@ async def test_the_plan_time_judge_is_frozen_and_used_after_settings_change(sess
     assert outcome.verdict is True, "the changed live judge would have failed this item"
 
 
+async def test_scoring_leaves_the_live_terminal_transition_to_the_runner(session: Session):
+    """Incremental run totals depend on the runner seeing scoring -> terminal."""
+    from gaugix.domain import ItemStatus
+    from gaugix.scoring.service import score_item
+
+    case = make_case(
+        session,
+        "Scored",
+        "question",
+        [{"type": "contains", "params": {"text": "answer"}, "required": True}],
+    )
+    eval_set = make_set(session, "Scored set", [case])
+    subject = make_fake_executor(session, "subject @ fake")
+    session.commit()
+    planned = plan_run(
+        session,
+        PlanRequest(set_ids=[eval_set.id or 0], executor_ids=[subject.id or 0]),
+    )
+    item = session.exec(select(RunItem).where(RunItem.run_id == planned.run.id)).one()
+    item.status = str(ItemStatus.scoring)
+    attempt = Attempt(run_item_id=item.id or 0, output_text="answer")
+    session.add(item)
+    session.add(attempt)
+    session.commit()
+
+    outcome = await score_item(session, item, attempt, planned.run.executors[0])
+    session.refresh(item)
+
+    assert outcome.verdict is True
+    assert item.status == str(ItemStatus.scoring)
+
+
+async def test_out_of_band_scoring_can_finalize_an_orphaned_scoring_item(session: Session):
+    """Re-score/human paths have no live runner to perform the terminal transition."""
+    from gaugix.domain import ItemStatus
+    from gaugix.scoring.service import score_item
+
+    case = make_case(
+        session,
+        "Scored out of band",
+        "question",
+        [{"type": "contains", "params": {"text": "answer"}, "required": True}],
+    )
+    eval_set = make_set(session, "Out-of-band set", [case])
+    subject = make_fake_executor(session, "subject @ fake")
+    session.commit()
+    planned = plan_run(
+        session,
+        PlanRequest(set_ids=[eval_set.id or 0], executor_ids=[subject.id or 0]),
+    )
+    item = session.exec(select(RunItem).where(RunItem.run_id == planned.run.id)).one()
+    item.status = str(ItemStatus.scoring)
+    attempt = Attempt(run_item_id=item.id or 0, output_text="answer")
+    session.add(item)
+    session.add(attempt)
+    session.commit()
+
+    outcome = await score_item(
+        session,
+        item,
+        attempt,
+        planned.run.executors[0],
+        finalize_status=True,
+    )
+    session.refresh(item)
+
+    assert outcome.verdict is True
+    assert item.status == str(ItemStatus.passed)
+
+
 async def test_plan_time_self_judging_stays_self_judging_if_a_default_is_added(session: Session):
     from gaugix.api.settings import KEY_DEFAULT_JUDGE_EXECUTOR, write_setting
     from gaugix.scoring.judge_config import default_judge_executor

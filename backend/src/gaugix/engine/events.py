@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
+from gaugix.config import redact_for_display
 from gaugix.logging_setup import get_logger
 
 log = get_logger("gaugix.events")
@@ -40,7 +41,10 @@ class Event:
     seq: int = 0
 
     def to_sse(self) -> dict[str, Any]:
-        return {"event": str(self.type), "data": {**self.data, "seq": self.seq}}
+        return {
+            "event": str(self.type),
+            "data": redact_for_display({**self.data, "seq": self.seq}),
+        }
 
 
 class EventBus:

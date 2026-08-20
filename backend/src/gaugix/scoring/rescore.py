@@ -108,6 +108,7 @@ async def rescore_items(
             judge_executor=judge_executor,
             only_indices=scorer_indices,
             use_frozen_judges=False,
+            finalize_status=True,
         )
         report.items_rescored += 1
         if before != outcome.verdict:

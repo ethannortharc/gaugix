@@ -514,6 +514,48 @@ async def test_human_score_rejects_an_out_of_range_scorer_index(client):
 # -- re-score (PRD F4.3) -------------------------------------------------------
 
 
+async def test_out_of_band_scoring_refuses_a_live_run(client, session):
+    from gaugix.domain import RunStatus
+    from gaugix.models.runs import Run
+
+    stack = await make_fake_stack(client, "idle-only")
+    eval_set = await make_set(client, name="Live scoring ownership")
+    await make_scored_case(
+        client,
+        eval_set["id"],
+        "Wait for runner",
+        "hello",
+        [{"type": "human", "params": {}, "required": True, "weight": 1}],
+    )
+    created = await client.post(
+        "/api/v1/runs",
+        json={
+            "set_ids": [eval_set["id"]],
+            "executor_ids": [stack["executor"]["id"]],
+            "start": False,
+        },
+    )
+    assert created.status_code == 201, created.text
+    run = created.json()
+    item = (await items_of(client, run["id"]))[0]
+    stored = session.get(Run, run["id"])
+    assert stored is not None
+    stored.status = str(RunStatus.running)
+    session.add(stored)
+    session.commit()
+
+    rescore = await client.post("/api/v1/rescore", json={"run_id": run["id"]})
+    human = await client.post(
+        f"/api/v1/items/{item['id']}/human-score",
+        json={"scorer_index": 0, "passed": True, "note": "too early"},
+    )
+
+    assert rescore.status_code == 422
+    assert human.status_code == 422
+    assert "while execution is active" in rescore.text
+    assert "while execution is active" in human.text
+
+
 async def test_rescoring_after_a_config_fix_changes_the_verdict_without_re_invoking(client):
     """The headline promise: fix the scorer, pay nothing, get the right answer."""
     stack = await make_fake_stack(client, "echo")
@@ -704,7 +746,7 @@ async def test_a_custom_rubric_cannot_shadow_a_built_in(client):
 # -- rerun-from (PRD F3.6) -----------------------------------------------------
 
 
-async def test_rerun_from_resets_only_later_items_in_the_same_lane(client):
+async def test_rerun_from_resets_only_later_items_in_the_same_lane(client, session):
     """The draft's requirement: don't redo the whole set after fixing one bug."""
     stack_a = await make_fake_stack(client, "lane-a")
     stack_b = await make_fake_stack(client, "lane-b")
@@ -735,6 +777,16 @@ async def test_rerun_from_resets_only_later_items_in_the_same_lane(client):
     lane_b = [i for i in items if i["executor_key"] == stack_b["executor"]["name"]]
 
     target = lane_a[1]
+    # Unrelated unfinished states can remain after a canceled diagnostic run.
+    # Rerun-from is lane-scoped and must not silently resume or re-pay for them.
+    from gaugix.domain import ItemStatus
+    from gaugix.models.runs import RunItem
+
+    unrelated = session.get(RunItem, lane_b[0]["id"])
+    assert unrelated is not None
+    unrelated.status = str(ItemStatus.error)
+    session.add(unrelated)
+    session.commit()
     response = await client.post(f"/api/v1/runs/{run['id']}/items/{target['id']}/rerun-from")
     assert response.status_code == 200
     assert response.json()["affected"] == 3, "positions 1..3 of lane A only"
@@ -747,6 +799,8 @@ async def test_rerun_from_resets_only_later_items_in_the_same_lane(client):
         detail = (await client.get(f"/api/v1/items/{item['id']}")).json()
         assert len(detail["attempts"]) == 1
         assert detail["attempts"][0]["superseded"] is False
+    unrelated_detail = (await client.get(f"/api/v1/items/{lane_b[0]['id']}")).json()
+    assert unrelated_detail["status"] == "error"
 
     # Lane A position 0 kept its single attempt; the rest have two.
     first = (await client.get(f"/api/v1/items/{lane_a[0]['id']}")).json()
@@ -796,6 +850,35 @@ async def test_rerun_whole_run_links_the_lineage(client):
 
     # The parent is untouched.
     assert (await client.get(f"/api/v1/runs/{parent['id']}")).json()["totals"]["passed"] == 1
+
+
+async def test_rerun_requires_fresh_code_execution_consent_if_a_set_changed(client):
+    from tests.api.test_preflight import EXECUTING_SCORER
+
+    stack = await make_fake_stack(client, "consent-change")
+    eval_set = await make_set(client, name="Consent can change")
+    case = await make_scored_case(
+        client,
+        eval_set["id"],
+        "Initially safe",
+        "hello",
+        [{"type": "contains", "params": {"text": "hello"}, "required": True, "weight": 1}],
+    )
+    parent = await run_and_wait(client, eval_set["id"], stack["executor"]["id"])
+    changed = await client.patch(f"/api/v1/cases/{case['id']}", json={"scoring": EXECUTING_SCORER})
+    assert changed.status_code == 200, changed.text
+
+    response = await client.post(f"/api/v1/runs/{parent['id']}/rerun")
+
+    assert response.status_code == 422
+    assert "model-written code" in response.json()["error"]["message"]
+
+    accepted = await client.post(
+        f"/api/v1/runs/{parent['id']}/rerun",
+        json={"accept_code_execution": True},
+    )
+    assert accepted.status_code == 201, accepted.text
+    assert accepted.json()["parent_run_id"] == parent["id"]
 
 
 async def test_a_class_graded_judge_is_counted_per_class(client):

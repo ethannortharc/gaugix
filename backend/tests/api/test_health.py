@@ -15,6 +15,19 @@ async def test_health_reports_ok(client):
     assert body["data_dir"]
 
 
+async def test_health_reports_configured_instance_id(client, monkeypatch):
+    monkeypatch.setenv("GAUGIX_INSTANCE_ID", "hybrid-test")
+    from gaugix.config import reset_settings_cache
+
+    reset_settings_cache()
+    try:
+        response = await client.get("/api/health")
+        assert response.status_code == 200
+        assert response.json()["instance_id"] == "hybrid-test"
+    finally:
+        reset_settings_cache()
+
+
 async def test_unknown_api_route_uses_the_error_envelope(client):
     response = await client.get("/api/v1/does-not-exist")
     assert response.status_code == 404

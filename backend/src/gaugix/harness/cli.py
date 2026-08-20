@@ -35,7 +35,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import shlex
 import shutil
 import time
@@ -44,6 +43,7 @@ from pathlib import Path
 from typing import Any
 
 from gaugix.artifacts import store
+from gaugix.config import credential_environment
 from gaugix.domain import (
     ArtifactIn,
     CaseSnapshot,
@@ -79,10 +79,11 @@ def validate_config(config: dict[str, Any]) -> str:
 
 def build_env(config: dict[str, Any]) -> dict[str, str]:
     """A minimal environment plus the names this profile allows through."""
-    env = {key: os.environ[key] for key in BASE_ENV_KEYS if key in os.environ}
+    environment = credential_environment()
+    env = {key: environment[key] for key in BASE_ENV_KEYS if key in environment}
     allowlist = config.get("env_allowlist") or []
     for name in allowlist if isinstance(allowlist, list) else []:
-        value = os.environ.get(str(name))
+        value = environment.get(str(name))
         if value is not None:
             env[str(name)] = value
     return env

@@ -28,6 +28,7 @@ def health() -> dict[str, Any]:
     return {
         "status": "ok" if db_state == "ok" else "degraded",
         "version": __version__,
+        "instance_id": settings.instance_id,
         "db": db_state,
         "data_dir": str(settings.resolved_data_dir),
     }

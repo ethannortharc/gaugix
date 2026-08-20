@@ -9,7 +9,7 @@ import asyncio
 
 from sqlmodel import Session, col, select
 
-from gaugix.domain import AttemptStatus, ItemStatus, RunStatus
+from gaugix.domain import AttemptStatus, InvocationResult, ItemStatus, RunStatus, Usage
 from gaugix.engine.events import Event, EventType, bus
 from gaugix.engine.planner import PlanRequest, plan_run
 from gaugix.engine.recovery import recover_interrupted_runs
@@ -19,6 +19,7 @@ from gaugix.engine.runner import (
     recompute_totals,
     registry,
     schedulable_item_ids,
+    set_score_hook,
     start_run,
 )
 from gaugix.models.executors import HarnessProfile
@@ -79,6 +80,35 @@ async def test_each_item_gets_an_attempt_with_the_harness_output(engine, session
     assert outputs["Beta"] == "DEFAULT-RESPONSE"
 
 
+async def test_unexpected_harness_exception_marks_one_item_without_aborting_siblings(
+    engine, session, demo, monkeypatch
+):
+    import gaugix.engine.runner as runner_module
+
+    class OneBrokenAdapter:
+        async def invoke(self, case, _model, _ctx):
+            if case.title == "Alpha":
+                raise RuntimeError("sensitive provider internals")
+            return InvocationResult(
+                output_text="ok",
+                messages=[{"role": "assistant", "content": "ok"}],
+                usage=Usage(),
+            )
+
+    monkeypatch.setattr(runner_module, "get_harness", lambda _kind: OneBrokenAdapter())
+    run_id = plan(session, demo["set_id"], [demo["echo_id"]])
+
+    run = await run_to_completion(engine, run_id)
+    items = items_of(engine, run_id)
+
+    assert run.status == str(RunStatus.completed)
+    assert [item.status for item in items].count(str(ItemStatus.error)) == 1
+    assert [item.status for item in items].count(str(ItemStatus.passed)) == 2
+    failed = next(item for item in items if item.status == str(ItemStatus.error))
+    assert failed.error == "unexpected harness error: RuntimeError"
+    assert "sensitive provider internals" not in failed.error
+
+
 async def test_two_executors_produce_independent_lanes(engine, session, demo):
     run_id = plan(session, demo["set_id"], [demo["echo_id"], demo["scripted_id"]])
     run = await run_to_completion(engine, run_id)
@@ -112,6 +142,43 @@ async def test_serial_concurrency_still_completes(engine, session, demo):
     run = await run_to_completion(engine, run_id)
     assert run.status == str(RunStatus.completed)
     assert run.totals["passed"] == 3
+
+
+async def test_live_totals_move_finished_items_out_of_scoring(engine, session):
+    """The running UI must not wait for finalisation to show terminal counts."""
+    from gaugix.scoring.service import score_item
+
+    cases = [make_case(session, "First", "one"), make_case(session, "Second", "two")]
+    eval_set = make_set(session, "Live totals", cases)
+    executor = make_fake_executor(session, "live totals @ fake")
+    session.commit()
+    second_scored = asyncio.Event()
+    release_second = asyncio.Event()
+    calls = 0
+
+    async def pausing_score_hook(session, item, attempt, executor_snapshot):
+        nonlocal calls
+        outcome = await score_item(session, item, attempt, executor_snapshot)
+        calls += 1
+        if calls == 2:
+            second_scored.set()
+            await release_second.wait()
+        return outcome
+
+    set_score_hook(pausing_score_hook)
+    run_id = plan(session, eval_set.id or 0, [executor.id or 0], concurrency=1)
+    handle = await start_run(engine, run_id)
+    await asyncio.wait_for(second_scored.wait(), timeout=2)
+    try:
+        with Session(engine) as live:
+            run = live.get(Run, run_id)
+            assert run is not None
+            assert run.totals["passed"] == 1
+            assert run.totals["scoring"] == 1
+            assert run.totals["pending"] == 0
+    finally:
+        release_second.set()
+    await asyncio.wait_for(handle.task, timeout=2)
 
 
 # -- retries -------------------------------------------------------------------

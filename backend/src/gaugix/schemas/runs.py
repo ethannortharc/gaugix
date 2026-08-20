@@ -148,6 +148,7 @@ class AttemptRead(BaseModel):
     id: int
     n: int
     status: str
+    request: dict[str, Any] = Field(default_factory=dict)
     output_text: str
     messages: list[dict[str, Any]]
     prompt_tokens: int
@@ -175,6 +176,7 @@ class RunItemRead(BaseModel):
     score_value: float | None
     needs_human: bool
     error: str | None
+    score_summary: str | None = None
     updated_at: datetime
 
 
@@ -184,6 +186,7 @@ class RunItemDetail(RunItemRead):
     input: list[Message]
     reference: str | None
     case_snapshot: CaseSnapshot
+    executor_snapshot: dict[str, Any] | None = None
     attempts: list[AttemptRead] = Field(default_factory=list)
     scores: list[ScoreRead] = Field(default_factory=list)
     artifacts: list[dict[str, Any]] = Field(default_factory=list)
@@ -223,6 +226,14 @@ class RerunFromResponse(BaseModel):
     affected: int = Field(description="Items reset in this executor lane")
     status: str
     message: str | None = None
+
+
+class RerunRequest(BaseModel):
+    """Optional fresh consent when a rerun newly requires code execution."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    accept_code_execution: bool = False
 
 
 class BaselineRequest(BaseModel):

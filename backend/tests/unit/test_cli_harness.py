@@ -103,6 +103,25 @@ def test_nothing_is_allowed_through_by_default(monkeypatch: pytest.MonkeyPatch):
     assert "ANTHROPIC_API_KEY" not in build_env({})
 
 
+def test_subprocess_environment_uses_the_frozen_credential_view(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from gaugix.config import credential_environment, reset_settings_cache
+
+    monkeypatch.setenv("GAUGIX_FREEZE_CREDENTIALS", "1")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "frozen-value")
+    reset_settings_cache()
+    try:
+        credential_environment()
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "rotated-value")
+
+        env = build_env({"env_allowlist": ["ANTHROPIC_API_KEY"]})
+
+        assert env["ANTHROPIC_API_KEY"] == "frozen-value"
+    finally:
+        reset_settings_cache()
+
+
 # -- usage parsing -------------------------------------------------------------
 
 
