@@ -88,11 +88,15 @@ export function ImportDialog({
   onOpenChange,
   setId,
   setName,
+  nodeId,
+  nodePath,
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
   setId?: number
   setName?: string
+  nodeId?: number
+  nodePath?: string[]
 }) {
   const [content, setContent] = React.useState('')
   const [format, setFormat] = React.useState<ImportFormat>('jsonl')
@@ -119,6 +123,7 @@ export function ImportDialog({
         content,
         format,
         set_id: setId,
+        node_id: nodeId,
         dry_run: dryRun,
         ...(mapped ? { mapping } : {}),
       },
@@ -171,7 +176,10 @@ export function ImportDialog({
           <DialogDescription>
             {setName ? (
               <>
-                Cases are added to <strong>{setName}</strong>, in file order.{' '}
+                Cases are added to <strong>{setName}</strong>
+                {nodePath?.length ? ` / ${nodePath.join(' / ')}` : ' / Ungrouped'}, in file order.
+                Native <code className="font-mono">group_path</code> values create nested branches
+                below this destination.{' '}
               </>
             ) : null}
             Import is all-or-nothing: if any row is invalid, nothing is written.

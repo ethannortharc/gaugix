@@ -33,6 +33,7 @@ import {
 } from '@/api/runs'
 import type { ItemStatus, RunItem } from '@/api/types'
 import { ConfirmDialog } from '@/components/ConfirmDialog'
+import { EvaluationMetricsPanel } from '@/components/EvaluationMetricsPanel'
 import { PageHeader } from '@/components/layout/AppShell'
 import { LoadMore } from '@/components/LoadMore'
 import { usePagedLimit } from '@/lib/paging'
@@ -360,6 +361,8 @@ export default function RunDetailPage() {
           <JudgeClassRow runId={runId} />
         </CardContent>
       </Card>
+
+      <EvaluationMetricsPanel runId={runId} config={run.config} live={live} />
 
       {run.error ? (
         <div className="mb-4 rounded-md border border-[var(--destructive)]/40 bg-[var(--destructive)]/5 p-3 text-sm">

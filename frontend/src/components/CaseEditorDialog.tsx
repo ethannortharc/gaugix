@@ -37,12 +37,14 @@ export function CaseEditorDialog({
   onOpenChange,
   caseData,
   setId,
+  nodeId,
   setDefaultScoring = [],
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
   caseData: EvalCase | null
   setId?: number
+  nodeId?: number
   setDefaultScoring?: ScorerSpec[]
 }) {
   const create = useCreateCase()
@@ -131,7 +133,7 @@ export function CaseEditorDialog({
       )
     } else {
       create.mutate(
-        { ...payload, set_id: setId },
+        { ...payload, set_id: setId, node_id: nodeId },
         {
           onSuccess: () => {
             toast.success('Case created')

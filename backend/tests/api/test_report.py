@@ -285,6 +285,49 @@ async def test_the_report_says_how_pass_rate_was_computed(client):
     assert "passed ÷ scored" in html
 
 
+async def test_the_report_includes_metrics_from_the_frozen_generic_profile(client):
+    profile = {
+        "kind": "binary_classification",
+        "name": "Generic policy classifier",
+        "truth": {"source": "tag", "key": "label"},
+        "prediction": {"source": "output_json", "key": "verdict"},
+        "positive_values": ["positive", "blocked"],
+        "negative_values": ["negative", "allowed"],
+        "positive_label": "blocked",
+        "negative_label": "allowed",
+        "false_positive_label": "Benign false-positive rate",
+    }
+    eval_set = await make_set(client, name="Policy classification", evaluation_profile=profile)
+    for title, label in (("positive case", "positive"), ("negative case", "negative")):
+        created = await client.post(
+            "/api/v1/cases",
+            json={
+                "title": title,
+                "input": [{"role": "user", "content": title}],
+                "tags": [f"label:{label}"],
+                "set_id": eval_set["id"],
+            },
+        )
+        assert created.status_code == 201
+    stack = await make_fake_stack(
+        client,
+        "policy",
+        {"mode": "script", "default_response": '{"verdict":"blocked"}'},
+    )
+    created = await client.post(
+        "/api/v1/runs",
+        json={"set_ids": [eval_set["id"]], "executor_ids": [stack["executor"]["id"]]},
+    )
+    run = await wait_for_run(client, created.json()["id"])
+
+    html = await report_for_run(client, run["id"])
+    assert "Evaluation profile metrics" in html
+    assert "Generic policy classifier" in html
+    assert "Precision" in html
+    assert "Benign false-positive rate" in html
+    assert "Confusion matrix" in html
+
+
 async def test_an_unscored_item_is_shown_as_unscored_not_failed(client):
     eval_set = await make_set(client, name="Half measured")
     await make_case(client, eval_set["id"], "no scorers here", [])

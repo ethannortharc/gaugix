@@ -12,9 +12,10 @@ import json
 from datetime import datetime
 from typing import Any
 
+from sqlalchemy import UniqueConstraint
 from sqlmodel import Field, Index, SQLModel
 
-from gaugix.domain import CaseSnapshot, Message, ScorerSpec
+from gaugix.domain import CaseSnapshot, EvaluationProfile, Message, ScorerSpec
 from gaugix.models.base import (
     TimestampMixin,
     dump_json,
@@ -81,6 +82,49 @@ class EvalCase(TimestampMixin, table=True):
         )
 
 
+class EvalCollection(TimestampMixin, table=True):
+    """A reusable hierarchy above eval sets.
+
+    The API calls these collections; the UI presents root collections as
+    evaluation suites and nested collections as folders.  Nothing in this
+    model is Guardrail-specific, so the same hierarchy works for quality,
+    retrieval, agent, safety, latency, and other evaluation programmes.
+    """
+
+    __tablename__ = "eval_collection"
+    __table_args__ = (
+        UniqueConstraint("key", name="uq_eval_collection_key"),
+        Index("ix_eval_collection_parent_position", "parent_id", "position"),
+    )
+
+    id: int | None = Field(default=None, primary_key=True)
+    key: str = Field(index=True)
+    name: str = Field(index=True)
+    description: str | None = Field(default=None)
+    parent_id: int | None = Field(default=None, foreign_key="eval_collection.id", index=True)
+    position: int = Field(default=0)
+    visibility: str = Field(default="primary", index=True)
+    tags_json: str = Field(default="[]")
+    provenance_json: str = Field(default="{}")
+
+    @property
+    def tags(self) -> list[str]:
+        return load_str_list(self.tags_json)
+
+    @tags.setter
+    def tags(self, value: list[str]) -> None:
+        self.tags_json = dump_json(sorted({t.strip() for t in value if t.strip()}))
+
+    @property
+    def provenance(self) -> dict[str, Any]:
+        loaded = json.loads(self.provenance_json or "{}")
+        return loaded if isinstance(loaded, dict) else {}
+
+    @provenance.setter
+    def provenance(self, value: dict[str, Any]) -> None:
+        self.provenance_json = dump_json(value)
+
+
 class EvalSet(TimestampMixin, table=True):
     """A named, ordered collection of cases, with an optional default scoring config."""
 
@@ -95,6 +139,17 @@ class EvalSet(TimestampMixin, table=True):
     #: Where this set's cases came from, when it was installed from a benchmark:
     #: revision, checksum, licence, scorer version. Empty for hand-made sets.
     provenance_json: str = Field(default="{}")
+    #: Optional task semantics used by the generic metrics engine.  The empty
+    #: object is the backwards-compatible standard pass/fail profile.
+    evaluation_profile_json: str = Field(default="{}")
+    #: Optional placement in the library's generic collection hierarchy.
+    collection_id: int | None = Field(default=None, foreign_key="eval_collection.id", index=True)
+    #: Stable identity shared by set variants such as input/output/both.
+    logical_key: str | None = Field(default=None, index=True)
+    #: Optional variant label beneath ``logical_key``; not interpreted by Gaugix.
+    variant: str | None = Field(default=None)
+    #: ``primary`` is shown by default; ``fixture`` and ``hidden`` remain accessible.
+    visibility: str = Field(default="primary", index=True)
     deleted_at: datetime | None = Field(default=None)
 
     @property
@@ -105,6 +160,20 @@ class EvalSet(TimestampMixin, table=True):
     @provenance.setter
     def provenance(self, value: dict[str, Any]) -> None:
         self.provenance_json = dump_json(value)
+
+    @property
+    def evaluation_profile(self) -> EvaluationProfile:
+        loaded = json.loads(self.evaluation_profile_json or "{}")
+        try:
+            return EvaluationProfile.model_validate(loaded if isinstance(loaded, dict) else {})
+        except Exception:
+            # A malformed profile must not make a set unreadable. Preflight and
+            # the editor can surface/fix it; historical pass/fail still works.
+            return EvaluationProfile.standard()
+
+    @evaluation_profile.setter
+    def evaluation_profile(self, value: EvaluationProfile) -> None:
+        self.evaluation_profile_json = dump_json(value.model_dump(mode="json"))
 
     @property
     def tags(self) -> list[str]:
@@ -123,6 +192,44 @@ class EvalSet(TimestampMixin, table=True):
         self.default_scoring_json = dump_json([s.model_dump(mode="json") for s in value])
 
 
+class EvalSetNode(TimestampMixin, table=True):
+    """One organisational branch inside an eval set.
+
+    Nodes carry navigation and provenance, while the set remains the unit of
+    comparison and evaluation semantics.  That distinction lets a large set be
+    browsed as a tree without turning every folder into an unrelated dataset.
+    """
+
+    __tablename__ = "eval_set_node"
+    __table_args__ = (Index("ix_eval_set_node_parent_position", "set_id", "parent_id", "position"),)
+
+    id: int | None = Field(default=None, primary_key=True)
+    set_id: int = Field(foreign_key="eval_set.id", index=True)
+    parent_id: int | None = Field(default=None, foreign_key="eval_set_node.id", index=True)
+    name: str = Field(index=True)
+    description: str | None = Field(default=None)
+    position: int = Field(default=0)
+    tags_json: str = Field(default="[]")
+    provenance_json: str = Field(default="{}")
+
+    @property
+    def tags(self) -> list[str]:
+        return load_str_list(self.tags_json)
+
+    @tags.setter
+    def tags(self, value: list[str]) -> None:
+        self.tags_json = dump_json(sorted({t.strip() for t in value if t.strip()}))
+
+    @property
+    def provenance(self) -> dict[str, Any]:
+        loaded = json.loads(self.provenance_json or "{}")
+        return loaded if isinstance(loaded, dict) else {}
+
+    @provenance.setter
+    def provenance(self, value: dict[str, Any]) -> None:
+        self.provenance_json = dump_json(value)
+
+
 class SetMembership(SQLModel, table=True):
     """Case ↔ set membership with an explicit position (manual ordering, PRD F1.1)."""
 
@@ -136,6 +243,7 @@ class SetMembership(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     set_id: int = Field(foreign_key="eval_set.id", index=True)
     case_id: int = Field(foreign_key="eval_case.id", index=True)
+    node_id: int | None = Field(default=None, foreign_key="eval_set_node.id", index=True)
     position: int = Field(default=0)
 
 

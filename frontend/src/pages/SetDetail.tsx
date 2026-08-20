@@ -1,33 +1,44 @@
 import {
   ArrowLeft,
+  ChevronRight,
   ChevronDown,
   ChevronUp,
   Download,
-  FileUp,
+  ExternalLink,
+  FileText,
+  Folder,
+  FolderOpen,
+  Layers,
   ListPlus,
   Pencil,
   Play,
   Search,
-  Sparkles,
   Tag,
   Trash2,
   X,
 } from 'lucide-react'
 import * as React from 'react'
-import { Link, useParams } from 'react-router-dom'
+import { Link, useParams, useSearchParams } from 'react-router-dom'
 import { toast } from 'sonner'
 
 import {
   exportUrl,
   useBulkCaseOp,
+  useAssignCasesNode,
+  useCreateSetNode,
+  useDeleteSetNode,
   useDetachCases,
   useReorderCases,
   useSet,
   useSetCases,
+  useSetNodes,
   useSetOptions,
+  useUpdateSetNode,
 } from '@/api/cases'
-import type { EvalCase, ExportFormat } from '@/api/types'
+import type { EvalCase, EvalSetNode, ExportFormat } from '@/api/types'
+import { AddCasesDialog, type AddCasesMethod } from '@/components/AddCasesDialog'
 import { ProvenanceCard } from '@/components/BenchmarkBits'
+import { ConfirmDialog } from '@/components/ConfirmDialog'
 import { GenerateDialog } from '@/components/GenerateDialog'
 import { ImportDialog } from '@/components/ImportDialog'
 import { PageHeader } from '@/components/layout/AppShell'
@@ -40,8 +51,16 @@ import { ScoringSummary } from '@/components/ScoringBuilder'
 import { EmptyState, ErrorState, LoadingState } from '@/components/states'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
+import { Field, Input, Textarea } from '@/components/ui/input'
 import { Checkbox, Separator, Tooltip } from '@/components/ui/misc'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
 import {
   Select,
   SelectContent,
@@ -58,10 +77,12 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { pluralize, truncate } from '@/lib/format'
+import { cn } from '@/lib/utils'
 
 export default function SetDetailPage() {
   const params = useParams()
   const setId = Number(params.id)
+  const [searchParams, setSearchParams] = useSearchParams()
 
   const [q, setQ] = React.useState('')
   const [tagFilter, setTagFilter] = React.useState<string[]>([])
@@ -69,13 +90,19 @@ export default function SetDetailPage() {
   const [editing, setEditing] = React.useState<EvalCase | 'new' | null>(null)
   const [importing, setImporting] = React.useState(false)
   const [generating, setGenerating] = React.useState(false)
+  const [adding, setAdding] = React.useState(false)
+  const [addTargetNodeId, setAddTargetNodeId] = React.useState<number | undefined>()
   const [editingSet, setEditingSet] = React.useState(false)
+  const [selectedBranch, setSelectedBranch] = React.useState<number | 'ungrouped' | null>(null)
 
   const setQuery = useSet(setId)
+  const nodesQuery = useSetNodes(setId)
   const { limit, more, reset } = usePagedLimit()
   const casesQuery = useSetCases(setId, {
     q: q || undefined,
     tags: tagFilter.length ? tagFilter : undefined,
+    node_id: typeof selectedBranch === 'number' ? selectedBranch : undefined,
+    ungrouped: selectedBranch === 'ungrouped' || undefined,
     limit,
   })
 
@@ -83,7 +110,15 @@ export default function SetDetailPage() {
   // starts small and grows. Narrowing the filter restarts it.
   React.useEffect(() => {
     reset()
-  }, [q, tagFilter, reset])
+  }, [q, tagFilter, selectedBranch, reset])
+
+  React.useEffect(() => {
+    if (searchParams.get('add') !== '1') return
+    setAdding(true)
+    const next = new URLSearchParams(searchParams)
+    next.delete('add')
+    setSearchParams(next, { replace: true })
+  }, [searchParams, setSearchParams])
 
   // Stable identity: a fresh [] on every render would re-run the hooks below.
   const cases = React.useMemo(() => casesQuery.data?.items ?? [], [casesQuery.data])
@@ -104,6 +139,20 @@ export default function SetDetailPage() {
   if (!setQuery.data) return null
 
   const set = setQuery.data
+  const nodes = nodesQuery.data ?? []
+  const activeNode =
+    typeof selectedBranch === 'number'
+      ? (nodes.find((node) => node.id === selectedBranch) ?? null)
+      : null
+  const addTargetNode = nodes.find((node) => node.id === addTargetNodeId)
+
+  function chooseAddMethod(method: AddCasesMethod, nodeId?: number) {
+    setAdding(false)
+    setAddTargetNodeId(nodeId)
+    if (method === 'manual') setEditing('new')
+    if (method === 'import') setImporting(true)
+    if (method === 'ai') setGenerating(true)
+  }
 
   return (
     <>
@@ -111,7 +160,13 @@ export default function SetDetailPage() {
         title={
           <span className="flex items-center gap-2">
             <Button asChild variant="ghost" size="icon-sm" aria-label="Back to sets">
-              <Link to="/sets">
+              <Link
+                to={
+                  setQuery.data?.collection_id
+                    ? `/collections/${setQuery.data.collection_id}`
+                    : '/sets'
+                }
+              >
                 <ArrowLeft />
               </Link>
             </Button>
@@ -121,33 +176,41 @@ export default function SetDetailPage() {
         description={set.description}
         actions={
           <>
-            <Button asChild size="sm">
+            <Button
+              size="sm"
+              onClick={() => {
+                setAddTargetNodeId(typeof selectedBranch === 'number' ? selectedBranch : undefined)
+                setAdding(true)
+              }}
+            >
+              <ListPlus />
+              Add cases
+            </Button>
+            <Button asChild variant="outline" size="sm">
               <Link to={`/runs/new?set_id=${setId}`}>
                 <Play />
                 Run this set
               </Link>
-            </Button>
-            <Button variant="outline" size="sm" onClick={() => setGenerating(true)}>
-              <Sparkles />
-              Generate with AI
-            </Button>
-            <Button variant="outline" size="sm" onClick={() => setImporting(true)}>
-              <FileUp />
-              Import
             </Button>
             <ExportMenu setId={setId} />
             <Button variant="outline" size="sm" onClick={() => setEditingSet(true)}>
               <Pencil />
               Edit set
             </Button>
-            <Button variant="outline" size="sm" onClick={() => setEditing('new')}>
-              <ListPlus />
-              New case
-            </Button>
           </>
         }
       >
         <div className="mt-1 flex flex-wrap items-center gap-1.5">
+          {set.collection_id && set.collection_path.length > 0 ? (
+            <Link
+              to={`/collections/${set.collection_id}`}
+              className="mr-1 inline-flex items-center gap-1 text-[11px] text-[var(--primary)] hover:underline"
+            >
+              {set.collection_path.join(' / ')}
+              <ChevronRight className="size-3" />
+            </Link>
+          ) : null}
+          {set.variant ? <Badge variant="primary">variant: {set.variant}</Badge> : null}
           {set.tags.map((tag) => (
             <Badge key={tag}>{tag}</Badge>
           ))}
@@ -180,131 +243,609 @@ export default function SetDetailPage() {
         <SetRunHistory setId={setId} />
       </div>
 
-      <div className="mb-3 flex flex-wrap items-center gap-2">
-        <div className="relative min-w-56 max-w-sm flex-1">
-          <Search className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-[var(--muted-foreground)]" />
-          <Input
-            value={q}
-            onChange={(e) => setQ(e.target.value)}
-            placeholder="Search cases…"
-            className="pl-8"
-            aria-label="Search cases in this set"
-          />
-        </div>
-        {allTags.map((tag) => {
-          const active = tagFilter.includes(tag)
-          return (
-            <button
-              key={tag}
-              type="button"
-              onClick={() =>
-                setTagFilter((prev) => (active ? prev.filter((t) => t !== tag) : [...prev, tag]))
-              }
-              aria-pressed={active}
-            >
-              <Badge variant={active ? 'primary' : 'outline'} className="cursor-pointer">
-                {tag}
-              </Badge>
-            </button>
-          )
-        })}
-        {tagFilter.length > 0 ? (
-          <Button variant="ghost" size="sm" onClick={() => setTagFilter([])}>
-            <X />
-            Clear tags
-          </Button>
-        ) : null}
-        <span className="ml-auto text-xs text-[var(--muted-foreground)]">
-          {casesQuery.data?.total ?? 0} {pluralize(casesQuery.data?.total ?? 0, 'case')}
-        </span>
-      </div>
+      <div className="grid items-start gap-4 lg:grid-cols-[16rem_minmax(0,1fr)]">
+        <SetTreePanel
+          setId={setId}
+          caseCount={set.case_count}
+          nodes={nodes}
+          loading={nodesQuery.isLoading}
+          selected={selectedBranch}
+          onSelected={setSelectedBranch}
+          onAdd={(nodeId) => {
+            setAddTargetNodeId(nodeId)
+            setAdding(true)
+          }}
+        />
 
-      {selected.size > 0 ? (
-        <BulkBar setId={setId} selected={[...selected]} onDone={() => setSelected(new Set())} />
-      ) : null}
-
-      {casesQuery.isLoading ? (
-        <LoadingState label="Loading cases…" rows={5} />
-      ) : casesQuery.isError ? (
-        <ErrorState error={casesQuery.error} onRetry={() => void casesQuery.refetch()} />
-      ) : cases.length === 0 ? (
-        q || tagFilter.length ? (
-          <EmptyState
-            icon={<Search className="size-6" />}
-            title="No cases match these filters"
-            action={
+        <section className="min-w-0" aria-label="Cases in selected branch">
+          {activeNode ? (
+            <BranchSummary
+              node={activeNode}
+              onAdd={() => {
+                setAddTargetNodeId(activeNode.id)
+                setAdding(true)
+              }}
+            />
+          ) : null}
+          {selectedBranch === 'ungrouped' ? (
+            <div className="mb-3 flex items-start justify-between gap-3">
+              <div>
+                <h2 className="text-sm font-semibold">Ungrouped cases</h2>
+                <p className="text-xs text-[var(--muted-foreground)]">
+                  Cases in this set that have not been assigned to a branch.
+                </p>
+              </div>
               <Button
                 variant="outline"
                 size="sm"
                 onClick={() => {
-                  setQ('')
-                  setTagFilter([])
+                  setAddTargetNodeId(undefined)
+                  setAdding(true)
                 }}
               >
-                Clear filters
+                <ListPlus /> Add cases here
               </Button>
-            }
-          />
-        ) : (
-          <EmptyState
-            icon={<ListPlus className="size-6" />}
-            title="No cases in this set yet"
-            description="Write one by hand, import a JSONL file, or have an assistant draft a batch — every route ends in the same preview-before-commit step."
-            action={
-              <div className="flex flex-wrap justify-center gap-2">
-                <Button size="sm" onClick={() => setEditing('new')}>
-                  <ListPlus />
-                  Write a case
-                </Button>
-                <Button variant="outline" size="sm" onClick={() => setGenerating(true)}>
-                  <Sparkles />
-                  Generate with AI
-                </Button>
-                <Button variant="outline" size="sm" onClick={() => setImporting(true)}>
-                  <FileUp />
-                  Import
-                </Button>
-              </div>
-            }
-          />
-        )
-      ) : (
-        <>
-          <CaseTable
-            setId={setId}
-            cases={cases}
-            total={casesQuery.data?.total ?? cases.length}
-            selected={selected}
-            onSelected={setSelected}
-            onEdit={setEditing}
-            reorderable={
-              !q && tagFilter.length === 0 && cases.length >= (casesQuery.data?.total ?? 0)
-            }
-          />
-          <LoadMore
-            shown={cases.length}
-            total={casesQuery.data?.total ?? cases.length}
-            noun="case"
-            onMore={more}
-            busy={casesQuery.isFetching}
-          />
-        </>
-      )}
+            </div>
+          ) : null}
+
+          <div className="mb-3 flex flex-wrap items-center gap-2">
+            <div className="relative min-w-56 max-w-sm flex-1">
+              <Search className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-[var(--muted-foreground)]" />
+              <Input
+                value={q}
+                onChange={(e) => setQ(e.target.value)}
+                placeholder="Search cases…"
+                className="pl-8"
+                aria-label="Search cases in this set"
+              />
+            </div>
+            {allTags.map((tag) => {
+              const active = tagFilter.includes(tag)
+              return (
+                <button
+                  key={tag}
+                  type="button"
+                  onClick={() =>
+                    setTagFilter((prev) =>
+                      active ? prev.filter((t) => t !== tag) : [...prev, tag],
+                    )
+                  }
+                  aria-pressed={active}
+                >
+                  <Badge variant={active ? 'primary' : 'outline'} className="cursor-pointer">
+                    {tag}
+                  </Badge>
+                </button>
+              )
+            })}
+            {tagFilter.length > 0 ? (
+              <Button variant="ghost" size="sm" onClick={() => setTagFilter([])}>
+                <X />
+                Clear tags
+              </Button>
+            ) : null}
+            <span className="ml-auto text-xs text-[var(--muted-foreground)]">
+              {casesQuery.data?.total ?? 0} {pluralize(casesQuery.data?.total ?? 0, 'case')}
+            </span>
+          </div>
+
+          {selected.size > 0 ? (
+            <BulkBar
+              setId={setId}
+              nodes={nodes}
+              selected={[...selected]}
+              onDone={() => setSelected(new Set())}
+            />
+          ) : null}
+
+          {casesQuery.isLoading ? (
+            <LoadingState label="Loading cases…" rows={5} />
+          ) : casesQuery.isError ? (
+            <ErrorState error={casesQuery.error} onRetry={() => void casesQuery.refetch()} />
+          ) : cases.length === 0 ? (
+            q || tagFilter.length ? (
+              <EmptyState
+                icon={<Search className="size-6" />}
+                title="No cases match these filters"
+                action={
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      setQ('')
+                      setTagFilter([])
+                    }}
+                  >
+                    Clear filters
+                  </Button>
+                }
+              />
+            ) : (
+              <EmptyState
+                icon={<ListPlus className="size-6" />}
+                title={
+                  selectedBranch === null ? 'No cases in this set yet' : 'No cases in this branch'
+                }
+                description={
+                  selectedBranch === null
+                    ? 'Write one, import a batch, or have AI draft candidates — the destination set and branch stay explicit throughout.'
+                    : 'Create a case here or select cases from another branch and move them here.'
+                }
+                action={
+                  <div className="flex flex-wrap justify-center gap-2">
+                    <Button
+                      size="sm"
+                      onClick={() => {
+                        setAddTargetNodeId(
+                          typeof selectedBranch === 'number' ? selectedBranch : undefined,
+                        )
+                        setAdding(true)
+                      }}
+                    >
+                      <ListPlus />
+                      Add cases
+                    </Button>
+                  </div>
+                }
+              />
+            )
+          ) : (
+            <>
+              <CaseTable
+                setId={setId}
+                cases={cases}
+                total={casesQuery.data?.total ?? cases.length}
+                selected={selected}
+                onSelected={setSelected}
+                onEdit={setEditing}
+                reorderable={
+                  selectedBranch === null &&
+                  !q &&
+                  tagFilter.length === 0 &&
+                  cases.length >= (casesQuery.data?.total ?? 0)
+                }
+              />
+              <LoadMore
+                shown={cases.length}
+                total={casesQuery.data?.total ?? cases.length}
+                noun="case"
+                onMore={more}
+                busy={casesQuery.isFetching}
+              />
+            </>
+          )}
+        </section>
+      </div>
 
       <CaseEditorDialog
         open={editing !== null}
         onOpenChange={(open) => !open && setEditing(null)}
         caseData={editing === 'new' ? null : editing}
         setId={setId}
+        nodeId={editing === 'new' ? addTargetNodeId : undefined}
         setDefaultScoring={set.default_scoring}
       />
+      <AddCasesDialog
+        open={adding}
+        onOpenChange={setAdding}
+        setName={set.name}
+        nodes={nodes}
+        defaultNodeId={addTargetNodeId}
+        onChoose={chooseAddMethod}
+      />
       <SetDialog open={editingSet} onOpenChange={setEditingSet} editing={set} />
-      <ImportDialog open={importing} onOpenChange={setImporting} setId={setId} setName={set.name} />
+      <ImportDialog
+        open={importing}
+        onOpenChange={setImporting}
+        setId={setId}
+        setName={set.name}
+        nodeId={addTargetNodeId}
+        nodePath={addTargetNode?.path}
+      />
       <GenerateDialog
         open={generating}
         onOpenChange={setGenerating}
         setId={setId}
         setName={set.name}
+        nodeId={addTargetNodeId}
+        nodePath={addTargetNode?.path}
+      />
+    </>
+  )
+}
+
+type BranchSelection = number | 'ungrouped' | null
+
+function SetTreePanel({
+  setId,
+  caseCount,
+  nodes,
+  loading,
+  selected,
+  onSelected,
+  onAdd,
+}: {
+  setId: number
+  caseCount: number
+  nodes: EvalSetNode[]
+  loading: boolean
+  selected: BranchSelection
+  onSelected: (value: BranchSelection) => void
+  onAdd: (nodeId?: number) => void
+}) {
+  const [editing, setEditing] = React.useState<EvalSetNode | 'new' | null>(null)
+  const grouped = nodes.reduce((total, node) => total + node.direct_case_count, 0)
+  const ungrouped = Math.max(0, caseCount - grouped)
+  const selectedNode =
+    typeof selected === 'number' ? (nodes.find((node) => node.id === selected) ?? null) : null
+  const children = React.useMemo(() => {
+    const map = new Map<number | null, EvalSetNode[]>()
+    for (const node of nodes) {
+      const siblings = map.get(node.parent_id) ?? []
+      siblings.push(node)
+      map.set(node.parent_id, siblings)
+    }
+    for (const siblings of map.values()) siblings.sort((a, b) => a.position - b.position)
+    return map
+  }, [nodes])
+
+  function renderNodes(parentId: number | null): React.ReactNode {
+    return (children.get(parentId) ?? []).map((node) => (
+      <React.Fragment key={node.id}>
+        <button
+          type="button"
+          onClick={() => onSelected(node.id)}
+          className={cn(
+            'flex w-full items-center gap-1.5 rounded-md py-1.5 pr-2 text-left text-xs transition-colors',
+            selected === node.id
+              ? 'bg-[var(--primary)]/12 font-medium text-[var(--primary)]'
+              : 'text-[var(--muted-foreground)] hover:bg-[var(--muted)] hover:text-[var(--foreground)]',
+          )}
+          style={{ paddingLeft: `${8 + node.depth * 14}px` }}
+        >
+          <span className="w-3" />
+          {selected === node.id ? (
+            <FolderOpen className="size-3.5 shrink-0" />
+          ) : (
+            <Folder className="size-3.5 shrink-0" />
+          )}
+          <span className="min-w-0 flex-1 truncate">{node.name}</span>
+          <span className="tabular text-[10px] opacity-70">{node.descendant_case_count}</span>
+        </button>
+        {renderNodes(node.id)}
+      </React.Fragment>
+    ))
+  }
+
+  return (
+    <aside className="sticky top-0 overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--card)]">
+      <div className="flex items-center justify-between border-b border-[var(--border)] px-3 py-2.5">
+        <div>
+          <h2 className="text-xs font-semibold">Set structure</h2>
+          <p className="text-[10px] text-[var(--muted-foreground)]">
+            Browse without loading all rows
+          </p>
+        </div>
+        <div className="flex items-center gap-0.5">
+          {selectedNode ? (
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              onClick={() => setEditing(selectedNode)}
+              aria-label={`Edit ${selectedNode.name}`}
+            >
+              <Pencil />
+            </Button>
+          ) : null}
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            onClick={() => setEditing('new')}
+            aria-label="Add branch"
+          >
+            <ListPlus />
+          </Button>
+        </div>
+      </div>
+      <div className="max-h-[62vh] overflow-y-auto p-2">
+        <button
+          type="button"
+          onClick={() => onSelected(null)}
+          className={cn(
+            'mb-0.5 flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs transition-colors',
+            selected === null
+              ? 'bg-[var(--primary)]/12 font-medium text-[var(--primary)]'
+              : 'text-[var(--muted-foreground)] hover:bg-[var(--muted)] hover:text-[var(--foreground)]',
+          )}
+        >
+          <Layers className="size-3.5" />
+          <span className="flex-1">All cases</span>
+          <span className="tabular text-[10px] opacity-70">{caseCount}</span>
+        </button>
+        {loading ? (
+          <p className="px-2 py-3 text-xs text-[var(--muted-foreground)]">Loading branches…</p>
+        ) : (
+          renderNodes(null)
+        )}
+        {ungrouped > 0 ? (
+          <button
+            type="button"
+            onClick={() => onSelected('ungrouped')}
+            className={cn(
+              'mt-0.5 flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs transition-colors',
+              selected === 'ungrouped'
+                ? 'bg-[var(--primary)]/12 font-medium text-[var(--primary)]'
+                : 'text-[var(--muted-foreground)] hover:bg-[var(--muted)] hover:text-[var(--foreground)]',
+            )}
+          >
+            <FileText className="size-3.5" />
+            <span className="flex-1">Ungrouped</span>
+            <span className="tabular text-[10px] opacity-70">{ungrouped}</span>
+          </button>
+        ) : null}
+      </div>
+      <div className="flex flex-col gap-2 border-t border-[var(--border)] p-2">
+        <Button
+          variant="secondary"
+          size="sm"
+          className="w-full justify-start"
+          onClick={() => onAdd(typeof selected === 'number' ? selected : undefined)}
+        >
+          <ListPlus />
+          {selectedNode ? `Add to ${selectedNode.name}` : 'Add cases'}
+        </Button>
+        <p className="px-1 text-[10px] leading-relaxed text-[var(--muted-foreground)]">
+          Imports with <code className="font-mono">group_path</code> build nested branches below the
+          selected destination.
+        </p>
+      </div>
+      <NodeDialog
+        open={editing !== null}
+        onOpenChange={(open) => !open && setEditing(null)}
+        setId={setId}
+        nodes={nodes}
+        editing={editing === 'new' ? null : editing}
+        defaultParentId={editing === 'new' && selectedNode ? selectedNode.id : null}
+        onDeleted={(id) => {
+          if (selected === id) onSelected(null)
+          setEditing(null)
+        }}
+      />
+    </aside>
+  )
+}
+
+function BranchSummary({ node, onAdd }: { node: EvalSetNode; onAdd: () => void }) {
+  const source =
+    node.effective_provenance.source_url ??
+    node.effective_provenance.url ??
+    node.effective_provenance.huggingface_url
+  const sourceUrl = typeof source === 'string' ? source : null
+  return (
+    <div className="mb-3 flex flex-wrap items-start gap-3 rounded-lg border border-[var(--border)] bg-[var(--card)] px-3 py-2.5">
+      <div className="min-w-0 flex-1">
+        <div className="mb-0.5 flex items-center gap-1 text-[10px] text-[var(--muted-foreground)]">
+          {node.path.map((part, index) => (
+            <React.Fragment key={`${part}-${index}`}>
+              {index > 0 ? <ChevronRight className="size-3" /> : null}
+              <span>{part}</span>
+            </React.Fragment>
+          ))}
+        </div>
+        <h2 className="text-sm font-semibold">{node.name}</h2>
+        <p className="mt-0.5 text-xs text-[var(--muted-foreground)]">
+          {node.description || 'No branch description yet.'}
+        </p>
+      </div>
+      <div className="flex items-center gap-2 text-xs">
+        <Badge variant="outline">{node.descendant_case_count} cases</Badge>
+        {sourceUrl ? (
+          <a
+            href={sourceUrl}
+            target="_blank"
+            rel="noreferrer"
+            className="inline-flex items-center gap-1 text-[var(--primary)] hover:underline"
+          >
+            Source
+            <ExternalLink className="size-3" />
+          </a>
+        ) : null}
+        <Button variant="outline" size="sm" onClick={onAdd}>
+          <ListPlus /> Add cases here
+        </Button>
+      </div>
+    </div>
+  )
+}
+
+function NodeDialog({
+  open,
+  onOpenChange,
+  setId,
+  nodes,
+  editing,
+  defaultParentId,
+  onDeleted,
+}: {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  setId: number
+  nodes: EvalSetNode[]
+  editing: EvalSetNode | null
+  defaultParentId: number | null
+  onDeleted: (id: number) => void
+}) {
+  const create = useCreateSetNode(setId)
+  const update = useUpdateSetNode(setId)
+  const remove = useDeleteSetNode(setId)
+  const [confirmDelete, setConfirmDelete] = React.useState(false)
+  const [name, setName] = React.useState('')
+  const [description, setDescription] = React.useState('')
+  const [parentId, setParentId] = React.useState<number | null>(null)
+  const [sourceUrl, setSourceUrl] = React.useState('')
+  const [revision, setRevision] = React.useState('')
+  const [licence, setLicence] = React.useState('')
+
+  React.useEffect(() => {
+    if (!open) return
+    setName(editing?.name ?? '')
+    setDescription(editing?.description ?? '')
+    setParentId(editing?.parent_id ?? defaultParentId)
+    setSourceUrl(String(editing?.provenance.source_url ?? editing?.provenance.url ?? ''))
+    setRevision(String(editing?.provenance.revision ?? ''))
+    setLicence(String(editing?.provenance.licence ?? ''))
+  }, [open, editing, defaultParentId])
+
+  function submit(event: React.FormEvent) {
+    event.preventDefault()
+    const provenance: Record<string, unknown> = { ...(editing?.provenance ?? {}) }
+    delete provenance.url
+    delete provenance.source_url
+    delete provenance.revision
+    delete provenance.licence
+    if (sourceUrl.trim()) provenance.source_url = sourceUrl.trim()
+    if (revision.trim()) provenance.revision = revision.trim()
+    if (licence.trim()) provenance.licence = licence.trim()
+    const body = {
+      name: name.trim(),
+      description: description.trim() || null,
+      parent_id: parentId,
+      provenance,
+    }
+    const callbacks = {
+      onSuccess: () => {
+        toast.success(editing ? 'Branch updated' : 'Branch created')
+        onOpenChange(false)
+      },
+      onError: (error: Error) => toast.error(error.message),
+    }
+    if (editing) update.mutate({ id: editing.id, ...body }, callbacks)
+    else create.mutate(body, callbacks)
+  }
+
+  const busy = create.isPending || update.isPending || remove.isPending
+  return (
+    <>
+      <Dialog open={open} onOpenChange={onOpenChange}>
+        <DialogContent widthClass="max-w-xl">
+          <form onSubmit={submit} className="flex flex-col gap-4">
+            <DialogHeader>
+              <DialogTitle>{editing ? `Edit “${editing.name}”` : 'New branch'}</DialogTitle>
+              <DialogDescription>
+                Branches organise one EvalSet; they do not create separate metric contracts.
+              </DialogDescription>
+            </DialogHeader>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <Field label="Name" htmlFor="node-name">
+                <Input
+                  id="node-name"
+                  value={name}
+                  onChange={(event) => setName(event.target.value)}
+                  autoFocus
+                  required
+                />
+              </Field>
+              <Field label="Parent branch" htmlFor="node-parent">
+                <Select
+                  value={parentId === null ? '__root__' : String(parentId)}
+                  onValueChange={(value) =>
+                    setParentId(value === '__root__' ? null : Number(value))
+                  }
+                >
+                  <SelectTrigger id="node-parent">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="__root__">Top level</SelectItem>
+                    {nodes
+                      .filter((node) => node.id !== editing?.id)
+                      .map((node) => (
+                        <SelectItem key={node.id} value={String(node.id)}>
+                          {'· '.repeat(node.depth)}
+                          {node.name}
+                        </SelectItem>
+                      ))}
+                  </SelectContent>
+                </Select>
+              </Field>
+            </div>
+            <Field label="Description" htmlFor="node-description">
+              <Textarea
+                id="node-description"
+                value={description}
+                onChange={(event) => setDescription(event.target.value)}
+                rows={3}
+                className="font-sans text-sm"
+                placeholder="What this branch covers and why it exists."
+              />
+            </Field>
+            <div className="grid gap-3 sm:grid-cols-3">
+              <Field label="Official / source URL" htmlFor="node-source">
+                <Input
+                  id="node-source"
+                  type="url"
+                  value={sourceUrl}
+                  onChange={(event) => setSourceUrl(event.target.value)}
+                  placeholder="https://huggingface.co/…"
+                />
+              </Field>
+              <Field label="Revision" htmlFor="node-revision">
+                <Input
+                  id="node-revision"
+                  value={revision}
+                  onChange={(event) => setRevision(event.target.value)}
+                  placeholder="main / commit"
+                />
+              </Field>
+              <Field label="Licence" htmlFor="node-licence">
+                <Input
+                  id="node-licence"
+                  value={licence}
+                  onChange={(event) => setLicence(event.target.value)}
+                />
+              </Field>
+            </div>
+            <DialogFooter className="justify-between">
+              {editing ? (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  className="mr-auto text-[var(--destructive)]"
+                  onClick={() => setConfirmDelete(true)}
+                >
+                  <Trash2 />
+                  Delete branch
+                </Button>
+              ) : (
+                <span />
+              )}
+              <Button type="button" variant="ghost" onClick={() => onOpenChange(false)}>
+                Cancel
+              </Button>
+              <Button type="submit" disabled={!name.trim() || busy}>
+                {busy ? 'Saving…' : 'Save branch'}
+              </Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
+      <ConfirmDialog
+        open={confirmDelete}
+        onOpenChange={setConfirmDelete}
+        title={`Delete “${editing?.name ?? ''}”?`}
+        description="Only empty leaf branches can be deleted. Cases and child branches must be moved first."
+        busy={remove.isPending}
+        onConfirm={() => {
+          if (!editing) return
+          remove.mutate(editing.id, {
+            onSuccess: () => {
+              toast.success('Branch deleted')
+              setConfirmDelete(false)
+              onDeleted(editing.id)
+            },
+            onError: (error) => toast.error(error.message),
+          })
+        }}
       />
     </>
   )
@@ -457,15 +998,18 @@ function CaseTable({
 
 function BulkBar({
   setId,
+  nodes,
   selected,
   onDone,
 }: {
   setId: number
+  nodes: EvalSetNode[]
   selected: number[]
   onDone: () => void
 }) {
   const bulk = useBulkCaseOp()
   const detach = useDetachCases(setId)
+  const assign = useAssignCasesNode(setId)
   // Every set, so copy/move can reach every set (D-064).
   const sets = useSetOptions()
   const [tagDraft, setTagDraft] = React.useState('')
@@ -507,6 +1051,37 @@ function BulkBar({
           Run {selected.length} {pluralize(selected.length, 'case')}
         </Link>
       </Button>
+
+      {nodes.length > 0 ? (
+        <Select
+          onValueChange={(value) => {
+            const nodeId = value === '__ungrouped__' ? null : Number(value)
+            assign.mutate(
+              { case_ids: selected, node_id: nodeId },
+              {
+                onSuccess: (result) => {
+                  toast.success(`Moved ${result.count} ${pluralize(result.count, 'case')}`)
+                  onDone()
+                },
+                onError: (error) => toast.error(error.message),
+              },
+            )
+          }}
+        >
+          <SelectTrigger className="h-8 w-44" aria-label="Move to branch">
+            <SelectValue placeholder="Move to branch…" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="__ungrouped__">Ungrouped</SelectItem>
+            {nodes.map((node) => (
+              <SelectItem key={node.id} value={String(node.id)}>
+                {'· '.repeat(node.depth)}
+                {node.name}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      ) : null}
 
       <div className="flex items-center gap-1">
         <Tag className="size-3.5 text-[var(--muted-foreground)]" />

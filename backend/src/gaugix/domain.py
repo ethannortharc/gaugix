@@ -14,7 +14,7 @@ from __future__ import annotations
 import hashlib
 import json
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -47,6 +47,52 @@ class ScorerType(StrEnum):
     python = "python"
     llm_judge = "llm_judge"
     human = "human"
+
+
+class EvaluationValueSource(BaseModel):
+    """Where an evaluation profile reads one semantic value.
+
+    Profiles deliberately describe *data*, not a product vertical.  A binary
+    safety detector, a spam classifier, a routing model and a medical triage
+    classifier can therefore use the same aggregation engine by pointing it at
+    different case and output fields.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    source: Literal["tag", "reference", "output_json"]
+    key: str | None = None
+
+
+class EvaluationProfile(BaseModel):
+    """How a set's outcomes should be interpreted beyond pass/fail.
+
+    ``standard`` is the existing Gaugix behaviour. ``binary_classification``
+    adds confusion-matrix and calibration metrics without teaching the core
+    about Guardrails; Guardrail detection is one UI preset of this generic
+    profile.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["standard", "binary_classification"] = "standard"
+    name: str = "Standard evaluation"
+    description: str | None = None
+    truth: EvaluationValueSource | None = None
+    prediction: EvaluationValueSource | None = None
+    score: EvaluationValueSource | None = None
+    score_scale: Literal["0-1", "0-100"] = "0-1"
+    category_truth: EvaluationValueSource | None = None
+    category_prediction: EvaluationValueSource | None = None
+    positive_values: list[str] = Field(default_factory=lambda: ["positive"])
+    negative_values: list[str] = Field(default_factory=lambda: ["negative"])
+    positive_label: str = "positive"
+    negative_label: str = "negative"
+    false_positive_label: str = "False positive rate"
+
+    @classmethod
+    def standard(cls) -> EvaluationProfile:
+        return cls()
 
 
 class ScoreSource(StrEnum):

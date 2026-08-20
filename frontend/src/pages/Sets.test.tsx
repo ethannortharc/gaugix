@@ -2,7 +2,7 @@ import { screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-import type { EvalSet } from '@/api/types'
+import { STANDARD_EVALUATION_PROFILE, type EvalSet } from '@/api/types'
 import SetsPage from '@/pages/Sets'
 import { renderWithProviders } from '@/test/utils'
 
@@ -13,6 +13,13 @@ function makeSet(overrides: Partial<EvalSet> = {}): EvalSet {
     description: 'Jailbreaks and benign lookalikes',
     tags: ['guardrail'],
     default_scoring: [],
+    evaluation_profile: STANDARD_EVALUATION_PROFILE,
+    collection_id: null,
+    collection_key: null,
+    collection_path: [],
+    logical_key: null,
+    variant: null,
+    visibility: 'primary',
     case_count: 5,
     deleted_at: null,
     created_at: '2026-08-01T00:00:00Z',
@@ -39,27 +46,33 @@ describe('SetsPage', () => {
   it('shows a loading state first', () => {
     vi.mocked(fetch).mockReturnValue(new Promise(() => {}))
     renderWithProviders(<SetsPage />)
-    expect(screen.getByRole('status')).toHaveTextContent(/loading sets/i)
+    expect(screen.getByRole('status')).toHaveTextContent(/loading suites/i)
   })
 
   it('renders sets with their case counts and tags', async () => {
+    const user = userEvent.setup()
     vi.mocked(fetch).mockImplementation(async () => jsonResponse([makeSet()]))
     renderWithProviders(<SetsPage />)
+    await user.click(screen.getByRole('tab', { name: 'All sets' }))
 
     expect(await screen.findByText('Guardrail regression')).toBeInTheDocument()
-    expect(screen.getByText('5 cases')).toBeInTheDocument()
+    expect(screen.getAllByText('5 cases')).toHaveLength(2)
     expect(screen.getByText('guardrail')).toBeInTheDocument()
   })
 
   it('uses the singular form for a set with one case', async () => {
+    const user = userEvent.setup()
     vi.mocked(fetch).mockImplementation(async () => jsonResponse([makeSet({ case_count: 1 })]))
     renderWithProviders(<SetsPage />)
+    await user.click(screen.getByRole('tab', { name: 'All sets' }))
     expect(await screen.findByText('1 case')).toBeInTheDocument()
   })
 
   it('teaches what a set is when there are none', async () => {
+    const user = userEvent.setup()
     vi.mocked(fetch).mockImplementation(async () => jsonResponse([]))
     renderWithProviders(<SetsPage />)
+    await user.click(screen.getByRole('tab', { name: 'All sets' }))
 
     expect(await screen.findByText('No eval sets yet')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /create your first set/i })).toBeInTheDocument()
@@ -82,6 +95,7 @@ describe('SetsPage', () => {
     const user = userEvent.setup()
     vi.mocked(fetch).mockImplementation(async () => jsonResponse([makeSet()]))
     renderWithProviders(<SetsPage />)
+    await user.click(screen.getByRole('tab', { name: 'All sets' }))
     await screen.findByText('Guardrail regression')
 
     await user.type(screen.getByLabelText('Search sets'), 'jail')
@@ -95,7 +109,7 @@ describe('SetsPage', () => {
     const user = userEvent.setup()
     vi.mocked(fetch).mockImplementation(async () => jsonResponse([]))
     renderWithProviders(<SetsPage />)
-    await screen.findByText('No eval sets yet')
+    await screen.findByText('No evaluation suites yet')
 
     await user.click(screen.getByRole('tab', { name: 'Trash' }))
     expect(await screen.findByText('Trash is empty')).toBeInTheDocument()
@@ -111,7 +125,7 @@ describe('SetsPage', () => {
       return jsonResponse([])
     })
     renderWithProviders(<SetsPage />)
-    await screen.findByText('No eval sets yet')
+    await screen.findByText('No evaluation suites yet')
 
     await user.click(screen.getByRole('button', { name: /^new set$/i }))
     await user.type(await screen.findByLabelText('Name'), 'New set')
@@ -120,7 +134,36 @@ describe('SetsPage', () => {
     await waitFor(() => {
       const post = vi.mocked(fetch).mock.calls.find((c) => (c[1] as RequestInit)?.method === 'POST')
       expect(post).toBeDefined()
-      expect(JSON.parse(String((post![1] as RequestInit).body))).toMatchObject({ name: 'New set' })
+      expect(JSON.parse(String((post![1] as RequestInit).body))).toMatchObject({
+        name: 'New set',
+        evaluation_profile: { kind: 'standard' },
+      })
+    })
+  })
+
+  it('applies Guardrail as a preset of the generic binary profile', async () => {
+    const user = userEvent.setup()
+    vi.mocked(fetch).mockImplementation(async (_input, init) => {
+      if (init?.method === 'POST') return jsonResponse(makeSet(), { status: 201 })
+      return jsonResponse([])
+    })
+    renderWithProviders(<SetsPage />)
+    await screen.findByText('No evaluation suites yet')
+
+    await user.click(screen.getByRole('button', { name: /^new set$/i }))
+    await user.type(await screen.findByLabelText('Name'), 'Safety classification')
+    await user.click(screen.getByRole('button', { name: /guardrail preset/i }))
+    expect(screen.getByLabelText('Profile name')).toHaveValue('Guardrail detection')
+    await user.click(screen.getByRole('button', { name: /create set/i }))
+
+    await waitFor(() => {
+      const post = vi.mocked(fetch).mock.calls.find((call) => call[1]?.method === 'POST')
+      const body = JSON.parse(String(post?.[1]?.body))
+      expect(body.evaluation_profile).toMatchObject({
+        kind: 'binary_classification',
+        prediction: { source: 'output_json', key: 'verdict' },
+        false_positive_label: 'Over-refusal rate',
+      })
     })
   })
 
@@ -128,7 +171,7 @@ describe('SetsPage', () => {
     const user = userEvent.setup()
     vi.mocked(fetch).mockImplementation(async () => jsonResponse([]))
     renderWithProviders(<SetsPage />)
-    await screen.findByText('No eval sets yet')
+    await screen.findByText('No evaluation suites yet')
 
     await user.click(screen.getByRole('button', { name: /^new set$/i }))
     expect(await screen.findByRole('button', { name: /create set/i })).toBeDisabled()

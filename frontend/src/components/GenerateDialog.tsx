@@ -36,11 +36,15 @@ export function GenerateDialog({
   onOpenChange,
   setId,
   setName,
+  nodeId,
+  nodePath,
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
   setId?: number
   setName?: string
+  nodeId?: number
+  nodePath?: string[]
 }) {
   const [tab, setTab] = React.useState('prompt')
   const [topic, setTopic] = React.useState('')
@@ -136,14 +140,14 @@ export function GenerateDialog({
 
   function check() {
     importCases.mutate(
-      { content: pasted, format: 'jsonl', set_id: setId, dry_run: true },
+      { content: pasted, format: 'jsonl', set_id: setId, node_id: nodeId, dry_run: true },
       { onSuccess: setPreview, onError: (error) => toast.error(error.message) },
     )
   }
 
   function commit() {
     importCases.mutate(
-      { content: pasted, format: 'jsonl', set_id: setId },
+      { content: pasted, format: 'jsonl', set_id: setId, node_id: nodeId },
       {
         onSuccess: (res) => {
           setPreview(res)
@@ -169,6 +173,13 @@ export function GenerateDialog({
             Gaugix builds the prompt (with the schema and real examples from
             {setName ? ` “${setName}”` : ' your library'}). Run it in any assistant, then paste the
             JSONL back — it goes through the same validation as a manual import.
+            {setName ? (
+              <>
+                {' '}
+                New cases go to <strong>{setName}</strong>
+                {nodePath?.length ? ` / ${nodePath.join(' / ')}` : ' / Ungrouped'}.
+              </>
+            ) : null}
           </DialogDescription>
         </DialogHeader>
 

@@ -163,7 +163,14 @@ def dump_cases(cases: list[CaseIO], fmt: str = JSONL) -> str:
     if fmt in formats.EXPORTABLE_FOREIGN:
         return formats.dump_foreign(cases, fmt)
 
-    payloads = [c.model_dump(mode="json") for c in cases]
+    payloads = []
+    for case in cases:
+        payload = case.model_dump(mode="json")
+        # Preserve the established canonical shape for ungrouped exports while
+        # allowing a set-scoped file to rebuild its branches on import.
+        if not case.group_path:
+            payload.pop("group_path", None)
+        payloads.append(payload)
     if fmt == JSONL:
         return "".join(json.dumps(p, ensure_ascii=False, sort_keys=False) + "\n" for p in payloads)
     if fmt == YAML:

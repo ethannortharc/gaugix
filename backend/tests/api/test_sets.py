@@ -50,6 +50,28 @@ async def test_default_scoring_is_stored_on_the_set(client):
     assert eval_set["default_scoring"][0]["params"]["pass_threshold"] == 4
 
 
+async def test_generic_evaluation_profile_is_stored_without_guardrail_special_casing(client):
+    profile = {
+        "kind": "binary_classification",
+        "name": "Spam classifier",
+        "truth": {"source": "tag", "key": "label"},
+        "prediction": {"source": "output_json", "key": "classification"},
+        "positive_values": ["spam"],
+        "negative_values": ["ham"],
+        "positive_label": "spam",
+        "negative_label": "ham",
+        "false_positive_label": "Ham false-positive rate",
+    }
+    eval_set = await make_set(client, name="Spam", evaluation_profile=profile)
+    assert eval_set["evaluation_profile"]["kind"] == "binary_classification"
+    assert eval_set["evaluation_profile"]["prediction"]["key"] == "classification"
+
+
+async def test_set_rejects_an_unknown_collection(client):
+    response = await client.post("/api/v1/sets", json={"name": "Orphan", "collection_id": 999})
+    assert response.status_code == 404
+
+
 async def test_case_count_reflects_live_cases_only(client):
     eval_set = await make_set(client)
     keep = await make_case(client, title="Keep", set_id=eval_set["id"])

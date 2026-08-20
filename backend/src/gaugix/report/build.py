@@ -33,6 +33,7 @@ from gaugix.compare import (
     pass_rate,
 )
 from gaugix.config import redact_for_display
+from gaugix.evaluation.service import summarize_run
 from gaugix.models.runs import Attempt, Run, RunItem
 from gaugix.models.scores import Score
 from gaugix.report import svg
@@ -51,6 +52,7 @@ def _environment() -> Environment:
     env.filters["pct"] = _pct
     env.filters["num"] = _num
     env.filters["pretty"] = _pretty
+    env.filters["measure"] = _measure
     return env
 
 
@@ -72,6 +74,16 @@ def _num(value: float | None) -> str:
 
 def _pretty(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, indent=2, default=str)
+
+
+def _measure(value: float | None, unit: str = "ratio") -> str:
+    if value is None:
+        return "—"
+    if unit == "ratio":
+        return f"{value * 100:.1f}%"
+    if unit == "milliseconds":
+        return f"{value:,.0f} ms"
+    return f"{value:g}"
 
 
 def _stamp() -> str:
@@ -304,6 +316,7 @@ def build_run_report(session: Session, run: Run) -> str:
             "judge_note": _judge_note(session),
             "aggregate": aggregate_matrix(session, [run_id]),
             "attempt_count": _attempt_count(session, [run_id]),
+            "evaluation": summarize_run(session, run_id).model_dump(mode="json"),
         }
     )
     return _environment().get_template("report.html").render(**context)

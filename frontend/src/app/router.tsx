@@ -5,6 +5,7 @@ import BenchmarkDetailPage from '@/pages/BenchmarkDetail'
 import BenchmarksPage from '@/pages/Benchmarks'
 import CaseDetailPage from '@/pages/CaseDetail'
 import CasesPage from '@/pages/Cases'
+import CollectionDetailPage from '@/pages/CollectionDetail'
 import ComparePage from '@/pages/Compare'
 import SideBySidePage from '@/pages/SideBySide'
 import DashboardPage from '@/pages/Dashboard'
@@ -12,6 +13,7 @@ import ExecutorsPage from '@/pages/Executors'
 import ItemDetailPage from '@/pages/ItemDetail'
 import LearnPage from '@/pages/Learn'
 import NotFoundPage from '@/pages/NotFound'
+import PlaygroundPage from '@/pages/Playground'
 import RunDetailPage from '@/pages/RunDetail'
 import RunNewPage from '@/pages/RunNew'
 import ReviewPage from '@/pages/Review'
@@ -29,6 +31,8 @@ export const routes = [
       { index: true, element: <DashboardPage /> },
       { path: 'sets', element: <SetsPage /> },
       { path: 'sets/:id', element: <SetDetailPage /> },
+      { path: 'collections/:id', element: <CollectionDetailPage /> },
+      { path: 'playground', element: <PlaygroundPage /> },
       { path: 'cases', element: <CasesPage /> },
       { path: 'cases/:id', element: <CaseDetailPage /> },
       { path: 'benchmarks', element: <BenchmarksPage /> },

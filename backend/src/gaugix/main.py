@@ -100,22 +100,30 @@ def _mount_v1_routers(v1: APIRouter) -> None:
         artifacts,
         benchmarks,
         cases,
+        collections,
         compare,
+        evaluation,
         executors,
         gen,
         learn,
+        playground,
         runs,
         scores,
+        set_nodes,
         sets,
         settings,
     )
 
     v1.include_router(cases.router)
+    v1.include_router(collections.router)
     v1.include_router(benchmarks.router)
     v1.include_router(sets.router)
+    v1.include_router(set_nodes.router)
     v1.include_router(gen.router)
     v1.include_router(executors.router)
+    v1.include_router(playground.router)
     v1.include_router(runs.router)
+    v1.include_router(evaluation.router)
     v1.include_router(settings.router)
     v1.include_router(scores.router)
     v1.include_router(compare.router)

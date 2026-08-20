@@ -12,6 +12,7 @@ from sqlmodel import Session, col, select
 from gaugix import caseio, formats
 from gaugix.db import get_session
 from gaugix.errors import NotFoundError, ValidationError
+from gaugix.hierarchy import ensure_node_path, get_set_node, node_map, nodes_for_set, path_nodes
 from gaugix.history import case_run_history
 from gaugix.models.base import utcnow
 from gaugix.models.cases import EvalCase, EvalSet, SetMembership
@@ -52,6 +53,8 @@ def to_read(
     case: EvalCase,
     sets: list[tuple[int, str, int]] | None = None,
     position: int | None = None,
+    node_id: int | None = None,
+    node_path: list[str] | None = None,
 ) -> CaseRead:
     return CaseRead(
         id=case.id or 0,
@@ -66,6 +69,8 @@ def to_read(
         updated_at=case.updated_at,
         sets=[SetRef(id=s[0], name=s[1], position=s[2]) for s in (sets or [])],
         position=position,
+        node_id=node_id,
+        node_path=node_path or [],
     )
 
 
@@ -153,22 +158,31 @@ def export_cases(
     download: bool = Query(default=True),
 ) -> Response:
     """Export cases in the canonical schema (PRD F1.3)."""
-    statement = select(EvalCase).where(col(EvalCase.deleted_at).is_(None))
     if set_id is not None:
         get_live_set(session, set_id)
-        statement = (
-            select(EvalCase)
+        grouped_rows = session.exec(
+            select(EvalCase, SetMembership.node_id)
             .join(SetMembership, col(SetMembership.case_id) == col(EvalCase.id))
             .where(SetMembership.set_id == set_id, col(EvalCase.deleted_at).is_(None))
             .order_by(col(SetMembership.position))
-        )
-    elif case_ids:
-        statement = statement.where(col(EvalCase.id).in_(case_ids)).order_by(col(EvalCase.id))
+        ).all()
+        by_id = node_map(nodes_for_set(session, set_id))
+        io_cases = [
+            to_read(
+                case,
+                node_id=node_id,
+                node_path=[part.name for part in path_nodes(by_id, node_id)],
+            ).to_io()
+            for case, node_id in grouped_rows
+        ]
     else:
-        statement = statement.order_by(col(EvalCase.id))
+        statement = select(EvalCase).where(col(EvalCase.deleted_at).is_(None))
+        if case_ids:
+            statement = statement.where(col(EvalCase.id).in_(case_ids))
+        case_rows = session.exec(statement.order_by(col(EvalCase.id))).all()
+        io_cases = [to_read(case).to_io() for case in case_rows]
 
-    rows = session.exec(statement).all()
-    payload = caseio.dump_cases([to_read(c).to_io() for c in rows], fmt)
+    payload = caseio.dump_cases(io_cases, fmt)
 
     headers = {}
     if download:
@@ -205,6 +219,8 @@ def bulk_move(payload: BulkMoveOp, session: SessionDep) -> CountResponse:
     """Copy or move a selection into another set."""
     cases = _load_selection(session, payload.case_ids)
     get_live_set(session, payload.target_set_id)
+    if payload.target_node_id is not None:
+        get_set_node(session, payload.target_set_id, payload.target_node_id)
     if payload.mode == "move" and payload.source_set_id is None:
         raise ValidationError("source_set_id is required when mode='move'")
 
@@ -218,7 +234,12 @@ def bulk_move(payload: BulkMoveOp, session: SessionDep) -> CountResponse:
         if case.id in existing:
             continue
         session.add(
-            SetMembership(set_id=payload.target_set_id, case_id=case.id or 0, position=position)
+            SetMembership(
+                set_id=payload.target_set_id,
+                case_id=case.id or 0,
+                node_id=payload.target_node_id,
+                position=position,
+            )
         )
         position += 1
 
@@ -309,6 +330,7 @@ def import_cases(payload: ImportRequest, session: SessionDep) -> ImportResult:
         content=payload.content,
         fmt=payload.format,
         set_id=payload.set_id,
+        node_id=payload.node_id,
         dry_run=payload.dry_run,
         mapping=payload.mapping,
     )
@@ -320,6 +342,7 @@ async def import_cases_file(
     file: Annotated[UploadFile, File()],
     format: str | None = Query(default=None, pattern=f"^({IMPORT_FORMATS})$"),
     set_id: int | None = Query(default=None),
+    node_id: int | None = Query(default=None),
     dry_run: bool = Query(default=False),
 ) -> ImportResult:
     """Import from an uploaded file; the format is inferred from the extension."""
@@ -330,7 +353,14 @@ async def import_cases_file(
         raise ValidationError(f"file must be UTF-8 text ({exc.reason})") from exc
 
     fmt = format or _infer_format(file.filename or "", content)
-    return _do_import(session, content=content, fmt=fmt, set_id=set_id, dry_run=dry_run)
+    return _do_import(
+        session,
+        content=content,
+        fmt=fmt,
+        set_id=set_id,
+        node_id=node_id,
+        dry_run=dry_run,
+    )
 
 
 def _infer_format(filename: str, content: str = "") -> str:
@@ -362,11 +392,16 @@ def _do_import(
     content: str,
     fmt: str,
     set_id: int | None,
+    node_id: int | None,
     dry_run: bool,
     mapping: FieldMapping | None = None,
 ) -> ImportResult:
     if set_id is not None:
         get_live_set(session, set_id)
+        if node_id is not None:
+            get_set_node(session, set_id, node_id)
+    elif node_id is not None:
+        raise ValidationError("node_id requires set_id")
 
     cases, errors, warnings = caseio.parse_any(content, fmt, mapping)
     if errors:
@@ -375,7 +410,7 @@ def _do_import(
     if dry_run:
         return ImportResult(ok=True, imported=len(cases), warnings=warnings, dry_run=True)
 
-    created = create_cases(session, cases, set_id=set_id)
+    created = create_cases(session, cases, set_id=set_id, node_id=node_id)
     session.commit()
     return ImportResult(
         ok=True,
@@ -386,7 +421,11 @@ def _do_import(
 
 
 def create_cases(
-    session: Session, cases: list[CaseIO], *, set_id: int | None = None
+    session: Session,
+    cases: list[CaseIO],
+    *,
+    set_id: int | None = None,
+    node_id: int | None = None,
 ) -> list[EvalCase]:
     """Persist parsed cases and, optionally, append them to a set.
 
@@ -405,8 +444,20 @@ def create_cases(
 
     if set_id is not None:
         position = next_position(session, set_id)
-        for case in created:
-            session.add(SetMembership(set_id=set_id, case_id=case.id or 0, position=position))
+        for case, item in zip(created, cases, strict=True):
+            session.add(
+                SetMembership(
+                    set_id=set_id,
+                    case_id=case.id or 0,
+                    node_id=ensure_node_path(
+                        session,
+                        set_id,
+                        item.group_path,
+                        parent_id=node_id,
+                    ),
+                    position=position,
+                )
+            )
             position += 1
     return created
 
@@ -425,13 +476,18 @@ def create_case(payload: CaseCreate, session: SessionDep) -> CaseRead:
 
     if payload.set_id is not None:
         get_live_set(session, payload.set_id)
+        if payload.node_id is not None:
+            get_set_node(session, payload.set_id, payload.node_id)
         session.add(
             SetMembership(
                 set_id=payload.set_id,
                 case_id=case.id or 0,
+                node_id=payload.node_id,
                 position=next_position(session, payload.set_id),
             )
         )
+    elif payload.node_id is not None:
+        raise ValidationError("node_id requires set_id")
     session.commit()
     session.refresh(case)
     return to_read_many(session, [case])[0]
@@ -484,7 +540,12 @@ def update_case(case_id: int, payload: CaseUpdate, session: SessionDep) -> CaseR
 
 
 @router.post("/{case_id}/duplicate", response_model=CaseRead, status_code=201)
-def duplicate_case(case_id: int, session: SessionDep, set_id: int | None = None) -> CaseRead:
+def duplicate_case(
+    case_id: int,
+    session: SessionDep,
+    set_id: int | None = None,
+    node_id: int | None = None,
+) -> CaseRead:
     """Copy a case (PRD F1.7). Optionally drop the copy straight into a set."""
     source = get_live_case(session, case_id)
     copy = EvalCase(
@@ -499,11 +560,18 @@ def duplicate_case(case_id: int, session: SessionDep, set_id: int | None = None)
     session.flush()
     if set_id is not None:
         get_live_set(session, set_id)
+        if node_id is not None:
+            get_set_node(session, set_id, node_id)
         session.add(
             SetMembership(
-                set_id=set_id, case_id=copy.id or 0, position=next_position(session, set_id)
+                set_id=set_id,
+                case_id=copy.id or 0,
+                node_id=node_id,
+                position=next_position(session, set_id),
             )
         )
+    elif node_id is not None:
+        raise ValidationError("node_id requires set_id")
     session.commit()
     session.refresh(copy)
     return to_read_many(session, [copy])[0]

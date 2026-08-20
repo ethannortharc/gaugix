@@ -8,11 +8,11 @@ an export round-trips byte-for-byte through import.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from gaugix.domain import Message, ScorerSpec
+from gaugix.domain import EvaluationProfile, Message, ScorerSpec
 
 
 def _clean_tags(tags: list[str]) -> list[str]:
@@ -31,11 +31,23 @@ class CaseIO(BaseModel):
     scoring: list[ScorerSpec] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list)
     notes: str | None = None
+    group_path: list[str] = Field(
+        default_factory=list,
+        description="Optional EvalSet branch path used during set-scoped import/export",
+    )
 
     @field_validator("tags")
     @classmethod
     def _tags(cls, v: list[str]) -> list[str]:
         return _clean_tags(v)
+
+    @field_validator("group_path")
+    @classmethod
+    def _group_path(cls, v: list[str]) -> list[str]:
+        cleaned = [part.strip() for part in v]
+        if any(not part for part in cleaned):
+            raise ValueError("group_path parts must not be blank")
+        return cleaned
 
 
 class CaseCreate(BaseModel):
@@ -48,6 +60,7 @@ class CaseCreate(BaseModel):
     tags: list[str] = Field(default_factory=list)
     notes: str | None = None
     set_id: int | None = Field(default=None, description="Optionally attach to this set")
+    node_id: int | None = Field(default=None, description="Optional branch within set_id")
 
     @field_validator("tags")
     @classmethod
@@ -79,6 +92,7 @@ class SetRef(BaseModel):
     id: int
     name: str
     position: int
+    node_id: int | None = None
 
 
 class CaseRead(BaseModel):
@@ -96,6 +110,8 @@ class CaseRead(BaseModel):
     position: int | None = Field(
         default=None, description="Position within the set being listed, when applicable"
     )
+    node_id: int | None = Field(default=None, description="Leaf branch in the listed set")
+    node_path: list[str] = Field(default_factory=list)
 
     def to_io(self) -> CaseIO:
         return CaseIO(
@@ -105,6 +121,7 @@ class CaseRead(BaseModel):
             scoring=self.scoring,
             tags=self.tags,
             notes=self.notes,
+            group_path=self.node_path,
         )
 
 
@@ -115,6 +132,11 @@ class SetCreate(BaseModel):
     description: str | None = None
     tags: list[str] = Field(default_factory=list)
     default_scoring: list[ScorerSpec] = Field(default_factory=list)
+    evaluation_profile: EvaluationProfile = Field(default_factory=EvaluationProfile.standard)
+    collection_id: int | None = None
+    logical_key: str | None = Field(default=None, min_length=1)
+    variant: str | None = Field(default=None, min_length=1)
+    visibility: Literal["primary", "fixture", "hidden"] = "primary"
 
     @field_validator("tags")
     @classmethod
@@ -129,6 +151,11 @@ class SetUpdate(BaseModel):
     description: str | None = None
     tags: list[str] | None = None
     default_scoring: list[ScorerSpec] | None = None
+    evaluation_profile: EvaluationProfile | None = None
+    collection_id: int | None = None
+    logical_key: str | None = Field(default=None, min_length=1)
+    variant: str | None = Field(default=None, min_length=1)
+    visibility: Literal["primary", "fixture", "hidden"] | None = None
 
     @field_validator("tags")
     @classmethod
@@ -142,6 +169,13 @@ class SetRead(BaseModel):
     description: str | None
     tags: list[str]
     default_scoring: list[ScorerSpec]
+    evaluation_profile: EvaluationProfile
+    collection_id: int | None = None
+    collection_key: str | None = None
+    collection_path: list[str] = Field(default_factory=list)
+    logical_key: str | None = None
+    variant: str | None = None
+    visibility: Literal["primary", "fixture", "hidden"] = "primary"
     case_count: int = 0
     deleted_at: datetime | None
     created_at: datetime
@@ -150,6 +184,66 @@ class SetRead(BaseModel):
     #: checksum, licence, scorer version — plus `modified`, computed live, when
     #: the set no longer holds what was installed. Empty for hand-made sets.
     provenance: dict[str, Any] = Field(default_factory=dict)
+
+
+# -- set hierarchy ------------------------------------------------------------
+
+
+class SetNodeCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1)
+    parent_id: int | None = None
+    description: str | None = None
+    position: int | None = Field(default=None, ge=0)
+    tags: list[str] = Field(default_factory=list)
+    provenance: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("tags")
+    @classmethod
+    def _tags(cls, v: list[str]) -> list[str]:
+        return _clean_tags(v)
+
+
+class SetNodeUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = Field(default=None, min_length=1)
+    parent_id: int | None = None
+    description: str | None = None
+    position: int | None = Field(default=None, ge=0)
+    tags: list[str] | None = None
+    provenance: dict[str, Any] | None = None
+
+    @field_validator("tags")
+    @classmethod
+    def _tags(cls, v: list[str] | None) -> list[str] | None:
+        return _clean_tags(v) if v is not None else None
+
+
+class SetNodeRead(BaseModel):
+    id: int
+    set_id: int
+    parent_id: int | None
+    name: str
+    description: str | None
+    position: int
+    tags: list[str]
+    provenance: dict[str, Any]
+    effective_provenance: dict[str, Any]
+    path: list[str]
+    depth: int
+    direct_case_count: int
+    descendant_case_count: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class AssignCasesNode(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    case_ids: list[int] = Field(min_length=1)
+    node_id: int | None = None
 
 
 # -- membership ---------------------------------------------------------------
@@ -161,6 +255,7 @@ class AttachCases(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     case_ids: list[int] = Field(min_length=1)
+    node_id: int | None = None
 
 
 class DetachCases(BaseModel):
@@ -195,6 +290,7 @@ class BulkMoveOp(BaseModel):
 
     case_ids: list[int] = Field(min_length=1)
     target_set_id: int
+    target_node_id: int | None = None
     source_set_id: int | None = Field(
         default=None, description="Required when mode='move' — the set to detach from"
     )
@@ -241,6 +337,10 @@ class ImportRequest(BaseModel):
     content: str = Field(min_length=1)
     format: str = Field(default="jsonl", pattern=f"^({IMPORT_FORMATS})$")
     set_id: int | None = None
+    node_id: int | None = Field(
+        default=None,
+        description="Optional destination branch; imported group_path values are nested below it",
+    )
     dry_run: bool = False
     mapping: FieldMapping | None = None
 

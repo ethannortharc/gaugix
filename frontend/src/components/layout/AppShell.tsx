@@ -8,6 +8,7 @@ import {
   Layers,
   Library,
   Menu,
+  MessageSquareText,
   PlayCircle,
   Settings as SettingsIcon,
   UserRound,
@@ -31,14 +32,30 @@ import { cn } from '@/lib/utils'
  * sits, with the theme switch next to it.
  */
 const NAV = [
-  { to: '/', label: 'Dashboard', icon: LayoutDashboard, end: true },
-  { to: '/sets', label: 'Eval sets', icon: Layers },
-  { to: '/cases', label: 'Cases', icon: FileText },
-  { to: '/benchmarks', label: 'Benchmarks', icon: Library },
-  { to: '/executors', label: 'Executors', icon: Cpu },
-  { to: '/runs', label: 'Runs', icon: PlayCircle },
-  { to: '/review', label: 'Review', icon: UserRound },
-  { to: '/compare', label: 'Compare', icon: BarChart3 },
+  {
+    label: 'Work',
+    items: [
+      { to: '/', label: 'Home', icon: LayoutDashboard, end: true },
+      { to: '/playground', label: 'Playground', icon: MessageSquareText },
+      { to: '/sets', label: 'Eval sets', icon: Layers },
+      { to: '/cases', label: 'Case library', icon: FileText },
+      { to: '/benchmarks', label: 'Benchmark catalog', icon: Library },
+    ],
+  },
+  {
+    label: 'Evaluate',
+    items: [
+      { to: '/runs/new', label: 'New evaluation', icon: FlaskConical },
+      { to: '/runs', label: 'Runs', icon: PlayCircle, end: true },
+    ],
+  },
+  {
+    label: 'Analyze',
+    items: [
+      { to: '/review', label: 'Review queue', icon: UserRound },
+      { to: '/compare', label: 'Compare', icon: BarChart3 },
+    ],
+  },
 ] as const
 
 function Wordmark() {
@@ -60,47 +77,76 @@ function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
     >
       <Wordmark />
       <Separator />
-      <ul className="flex flex-1 flex-col gap-0.5 overflow-y-auto p-2">
-        {NAV.map(({ to, label, icon: Icon, ...rest }) => (
-          <li key={to}>
-            <NavLink
-              to={to}
-              end={'end' in rest ? rest.end : undefined}
-              onClick={onNavigate}
-              className={({ isActive }) =>
-                cn(
-                  'flex items-center gap-2.5 rounded-md px-2.5 py-1.5 text-sm transition-colors',
-                  isActive
-                    ? 'bg-[var(--primary)]/12 font-medium text-[var(--primary)]'
-                    : 'text-[var(--muted-foreground)] hover:bg-[var(--muted)] hover:text-[var(--foreground)]',
-                )
-              }
-            >
-              <Icon className="size-4 shrink-0" />
-              {label}
-            </NavLink>
-          </li>
+      <div className="flex flex-1 flex-col gap-4 overflow-y-auto p-2">
+        {NAV.map((group) => (
+          <div key={group.label}>
+            <p className="mb-1 px-2.5 text-[10px] font-semibold uppercase tracking-[0.12em] text-[var(--muted-foreground)]/75">
+              {group.label}
+            </p>
+            <ul className="flex flex-col gap-0.5">
+              {group.items.map(({ to, label, icon: Icon, ...rest }) => (
+                <li key={to}>
+                  <NavLink
+                    to={to}
+                    end={'end' in rest ? rest.end : undefined}
+                    onClick={onNavigate}
+                    className={({ isActive }) =>
+                      cn(
+                        'flex items-center gap-2.5 rounded-md px-2.5 py-1.5 text-sm transition-colors',
+                        isActive
+                          ? 'bg-[var(--primary)]/12 font-medium text-[var(--primary)]'
+                          : 'text-[var(--muted-foreground)] hover:bg-[var(--muted)] hover:text-[var(--foreground)]',
+                      )
+                    }
+                  >
+                    <Icon className="size-4 shrink-0" />
+                    {label}
+                  </NavLink>
+                </li>
+              ))}
+            </ul>
+          </div>
         ))}
-      </ul>
+      </div>
 
       <Separator />
-      <div className="flex items-center gap-1.5 p-2">
+      <div className="p-2">
+        <p className="mb-1 px-2.5 text-[10px] font-semibold uppercase tracking-[0.12em] text-[var(--muted-foreground)]/75">
+          Configure
+        </p>
         <NavLink
-          to="/settings"
+          to="/executors"
           onClick={onNavigate}
           className={({ isActive }) =>
             cn(
-              'flex min-w-0 flex-1 items-center gap-2.5 rounded-md px-2.5 py-1.5 text-sm transition-colors',
+              'mb-0.5 flex items-center gap-2.5 rounded-md px-2.5 py-1.5 text-sm transition-colors',
               isActive
                 ? 'bg-[var(--primary)]/12 font-medium text-[var(--primary)]'
                 : 'text-[var(--muted-foreground)] hover:bg-[var(--muted)] hover:text-[var(--foreground)]',
             )
           }
         >
-          <SettingsIcon className="size-4 shrink-0" />
-          <span className="truncate">Settings</span>
+          <Cpu className="size-4 shrink-0" />
+          Executors
         </NavLink>
-        <ThemeToggle />
+        <div className="flex items-center gap-1.5">
+          <NavLink
+            to="/settings"
+            onClick={onNavigate}
+            className={({ isActive }) =>
+              cn(
+                'flex min-w-0 flex-1 items-center gap-2.5 rounded-md px-2.5 py-1.5 text-sm transition-colors',
+                isActive
+                  ? 'bg-[var(--primary)]/12 font-medium text-[var(--primary)]'
+                  : 'text-[var(--muted-foreground)] hover:bg-[var(--muted)] hover:text-[var(--foreground)]',
+              )
+            }
+          >
+            <SettingsIcon className="size-4 shrink-0" />
+            <span className="truncate">Settings</span>
+          </NavLink>
+          <ThemeToggle />
+        </div>
       </div>
     </nav>
   )
@@ -137,6 +183,7 @@ export function AppShell() {
   const [drawerOpen, setDrawerOpen] = React.useState(false)
   const location = useLocation()
   const drawerRef = React.useRef<HTMLDivElement>(null)
+  const mainRef = React.useRef<HTMLElement>(null)
 
   /*
     Escape closes it, and Tab stays inside it while it is open. Without the
@@ -170,7 +217,13 @@ export function AppShell() {
     return () => window.removeEventListener('keydown', onKey)
   }, [drawerOpen])
 
-  React.useEffect(() => setDrawerOpen(false), [location.pathname])
+  React.useEffect(() => {
+    setDrawerOpen(false)
+    // The shell owns the scroll container, so browser navigation cannot reset
+    // it for us.  Without this, leaving a long case table could open the next
+    // workflow step halfway down the page with its title and actions hidden.
+    if (mainRef.current) mainRef.current.scrollTop = 0
+  }, [location.pathname])
 
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-[var(--background)]">
@@ -221,7 +274,7 @@ export function AppShell() {
             <HealthChip />
           </div>
         </header>
-        <main className="min-h-0 flex-1 overflow-y-auto px-4 py-5 md:px-6">
+        <main ref={mainRef} className="min-h-0 flex-1 overflow-y-auto px-4 py-5 md:px-6">
           <Outlet />
         </main>
         <Footer />

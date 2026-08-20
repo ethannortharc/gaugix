@@ -112,6 +112,12 @@ class RunItem(TimestampMixin, table=True):
     set_id: int | None = Field(default=None, index=True)
     set_name: str = Field(default="")
     case_id: int | None = Field(default=None, index=True)
+    #: The leaf branch and both forms of its ancestry are frozen at plan time.
+    #: These are deliberately not foreign keys: deleting or reorganising the
+    #: live set must not invalidate historical reports.
+    node_id: int | None = Field(default=None, index=True)
+    node_path_json: str = Field(default="[]")
+    node_path_ids_json: str = Field(default="[]")
     executor_key: str = Field(default="", index=True)
     position: int = Field(default=0)
     case_snapshot_json: str = Field(default="{}")
@@ -135,6 +141,26 @@ class RunItem(TimestampMixin, table=True):
     def title(self) -> str:
         raw = load_json(self.case_snapshot_json, {})
         return str(raw.get("title", "")) if isinstance(raw, dict) else ""
+
+    @property
+    def node_path(self) -> list[str]:
+        value = load_json(self.node_path_json, [])
+        return [str(part) for part in value] if isinstance(value, list) else []
+
+    @node_path.setter
+    def node_path(self, value: list[str]) -> None:
+        self.node_path_json = dump_json(value)
+
+    @property
+    def node_path_ids(self) -> list[int]:
+        value = load_json(self.node_path_ids_json, [])
+        if not isinstance(value, list):
+            return []
+        return [part for part in value if isinstance(part, int) and not isinstance(part, bool)]
+
+    @node_path_ids.setter
+    def node_path_ids(self, value: list[int]) -> None:
+        self.node_path_ids_json = dump_json(value)
 
 
 class Attempt(TimestampMixin, table=True):
